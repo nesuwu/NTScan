@@ -18,8 +18,9 @@ use std::fs::{self, Metadata};
 use std::io;
 use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
@@ -29,7 +30,8 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 use windows::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     FILE_STANDARD_INFO, FileStandardInfo, FindClose, FindFirstStreamW, FindNextStreamW,
-    GetFileInformationByHandleEx, STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
+    GetCompressedFileSizeW, GetFileInformationByHandleEx, STREAM_INFO_LEVELS,
+    WIN32_FIND_STREAM_DATA,
 };
 use windows::core::{HRESULT, PCWSTR};
 
@@ -69,10 +71,54 @@ enum ScanMode {
     Accurate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ScanErrorKind {
+    AccessDenied,
+    SharingViolation,
+    ADSFailed,
+    PathTooLong,
+    Cancelled,
+    Other,
+}
+
+#[derive(Default, Clone)]
+struct ErrorStats {
+    counts: Arc<Mutex<HashMap<ScanErrorKind, usize>>>,
+}
+
+impl ErrorStats {
+    fn record(&self, kind: ScanErrorKind) {
+        let mut guard = self.counts.lock().unwrap();
+        *guard.entry(kind).or_insert(0) += 1;
+    }
+    fn snapshot(&self) -> HashMap<ScanErrorKind, usize> {
+        self.counts.lock().unwrap().clone()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScanOptions {
     mode: ScanMode,
     follow_symlinks: bool,
+}
+
+#[derive(Clone)]
+struct CancelFlag {
+    inner: Arc<AtomicBool>,
+}
+
+impl CancelFlag {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn cancel(&self) {
+        self.inner.store(true, AtomicOrdering::Relaxed);
+    }
+    fn is_cancelled(&self) -> bool {
+        self.inner.load(AtomicOrdering::Relaxed)
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +127,40 @@ struct ScanCache {
 }
 
 #[derive(Clone)]
+struct IoGate {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+}
+
+struct IoPermit {
+    gate: IoGate,
+}
+
+impl IoGate {
+    fn new(permits: usize) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(permits), Condvar::new())),
+        }
+    }
+
+    fn acquire(&self) -> IoPermit {
+        let (lock, cvar) = &*self.inner;
+        let mut guard = lock.lock().unwrap();
+        while *guard == 0 {
+            guard = cvar.wait(guard).unwrap();
+        }
+        *guard -= 1;
+        IoPermit { gate: self.clone() } // needs IoGate: Clone
+    }
+}
+
+impl Drop for IoPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.gate.inner;
+        let mut guard = lock.lock().unwrap();
+        *guard += 1;
+        cvar.notify_one();
+    }
+}
 struct CachedReport {
     mode: ScanMode,
     mtime: Option<SystemTime>,
@@ -143,6 +223,9 @@ struct ScanContext {
     cache: Arc<ScanCache>,
     visited: Arc<Visited>,
     progress: Option<Sender<ProgressEvent>>,
+    cancel: CancelFlag, // NEW
+    io_gate: IoGate,    // NEW
+    errors: ErrorStats, // NEW
 }
 
 #[derive(Clone)]
@@ -195,12 +278,21 @@ fn main() -> Result<()> {
 }
 
 impl ScanContext {
-    fn new(options: ScanOptions, progress: Option<Sender<ProgressEvent>>) -> Self {
+    fn new(
+        options: ScanOptions,
+        progress: Option<Sender<ProgressEvent>>,
+        cancel: CancelFlag,
+        io_gate: IoGate,
+        errors: ErrorStats,
+    ) -> Self {
         Self {
             options,
             cache: Arc::new(ScanCache::default()),
             visited: Arc::new(Visited::default()),
             progress,
+            cancel,
+            io_gate,
+            errors,
         }
     }
 
@@ -524,7 +616,7 @@ fn accumulate_file_sizes(
             }
         }
 
-        match get_allocated_size(path) {
+        match get_allocated_size_fast(path) {
             Ok(size) => {
                 allocated = Some(size);
             }
@@ -538,6 +630,18 @@ fn accumulate_file_sizes(
     }
 
     (logical, allocated)
+}
+
+fn get_allocated_size_fast(path: &Path) -> Result<u64> {
+    let wide = path_to_wide(path);
+    unsafe {
+        let mut high: u32 = 0;
+        let low = GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), &mut high as *mut u32);
+        if low == u32::MAX {
+            return get_allocated_size(path);
+        }
+        Ok(((high as u64) << 32) | (low as u64))
+    }
 }
 
 fn entry_with_error(
@@ -788,7 +892,28 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         }
     });
 
-    let context = Arc::new(ScanContext::new(options, Some(progress_tx.clone())));
+    let cancel = CancelFlag::new();
+    let io_gate = IoGate::new(16);
+    let errors = ErrorStats::default();
+
+    let context = Arc::new(ScanContext::new(
+        options,
+        None,
+        cancel.clone(),
+        io_gate.clone(),
+        errors.clone(),
+    ));
+
+    let mut app = App::new(
+        args.target.clone(),
+        directories.clone(),
+        precomputed_entries,
+        file_logical,
+        file_allocated,
+        options.mode,
+        cancel.clone(),
+        errors.clone(),
+    );
 
     if options.follow_symlinks {
         if let Ok(canon) = fs::canonicalize(&args.target) {
@@ -816,7 +941,19 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
     terminal.clear().context("failed to clear terminal")?;
 
     let result = (|| -> Result<()> {
-        let context = Arc::new(ScanContext::new(options, None));
+        // NEW: create shared primitives here (inside the closure)
+        let cancel = CancelFlag::new();
+        let io_gate = IoGate::new(16);
+        let errors = ErrorStats::default();
+
+        // NEW: pass all five args to ScanContext::new(...)
+        let context = Arc::new(ScanContext::new(
+            options,
+            None,
+            cancel.clone(),
+            io_gate.clone(),
+            errors.clone(),
+        ));
 
         if options.follow_symlinks {
             if let Ok(canon) = fs::canonicalize(&args.target) {
@@ -832,6 +969,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
         } = prepare_directory_plan(&args.target, context.as_ref())
             .with_context(|| format!("failed to read {}", args.target.display()))?;
 
+        // NEW: pass cancel + errors to App::new; keep this INSIDE the closure
         let mut app = App::new(
             args.target.clone(),
             directories.clone(),
@@ -839,6 +977,8 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             file_logical,
             file_allocated,
             options.mode,
+            cancel.clone(),
+            errors.clone(),
         );
 
         let (msg_tx, msg_rx) = mpsc::channel();
@@ -850,6 +990,9 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             let tx_pool = msg_tx.clone();
             std::thread::spawn(move || {
                 directories.into_par_iter().for_each(|job| {
+                    if scan_ctx.cancel.is_cancelled() {
+                        return;
+                    }
                     let ctx = Arc::clone(&scan_ctx);
                     let tx = tx_pool.clone();
                     tx.send(AppMessage::DirectoryStarted(job.path.clone())).ok();
@@ -915,6 +1058,13 @@ fn draw_app(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Length(5), Constraint::Min(6)])
         .split(frame.size());
 
+    let errs = app.errors.snapshot();
+    let cncl = *errs.get(&ScanErrorKind::Cancelled).unwrap_or(&0);
+    let adsf = *errs.get(&ScanErrorKind::ADSFailed).unwrap_or(&0);
+    let accd = *errs.get(&ScanErrorKind::AccessDenied).unwrap_or(&0);
+    let shrv = *errs.get(&ScanErrorKind::SharingViolation).unwrap_or(&0);
+    let othr = *errs.get(&ScanErrorKind::Other).unwrap_or(&0);
+
     let total_logical = app.total_logical();
     let allocated_text = app
         .total_allocated()
@@ -931,8 +1081,13 @@ fn draw_app(frame: &mut Frame<'_>, app: &App) {
             allocated_text,
             app.start.elapsed()
         )),
+        Line::from(format!(
+            "Errors — Cancelled:{}  ADS:{}  Access:{}  Share:{}  Other:{}",
+            cncl, adsf, accd, shrv, othr
+        )),
         Line::from("Press q to quit"),
     ];
+
     let header =
         Paragraph::new(header_lines).block(Block::default().title("Status").borders(Borders::ALL));
     frame.render_widget(header, chunks[0]);
@@ -997,6 +1152,8 @@ struct App {
     completed_dirs: usize,
     all_done: bool,
     should_quit: bool,
+    cancel: CancelFlag, // NEW
+    errors: ErrorStats, // NEW
 }
 
 impl App {
@@ -1007,6 +1164,8 @@ impl App {
         file_logical: u64,
         file_allocated: Option<u64>,
         mode: ScanMode,
+        cancel: CancelFlag,
+        errors: ErrorStats,
     ) -> Self {
         let total_dirs = directories.len();
         let directories = directories
@@ -1031,6 +1190,8 @@ impl App {
             completed_dirs: 0,
             all_done: false,
             should_quit: false,
+            cancel,
+            errors,
         }
     }
 
@@ -1044,9 +1205,15 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.should_quit = true;
+                self.cancel.cancel();
+                self.errors.record(ScanErrorKind::Cancelled);
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+                self.cancel.cancel();
+                self.errors.record(ScanErrorKind::Cancelled);
             }
             _ => {}
         }
