@@ -2,38 +2,61 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::model::{DirectoryReport, ErrorStats, ProgressEvent, ScanMode, ScanOptions};
+use crate::model::{DirectoryReport, ProgressEvent, ScanMode, ScanOptions};
 
+/// Cooperative cancellation flag shared across scanner tasks.
+///
+/// ```rust
+/// use foldersizer_cli::context::CancelFlag;
+///
+/// let flag = CancelFlag::new();
+/// assert!(!flag.is_cancelled());
+/// flag.cancel();
+/// assert!(flag.is_cancelled());
+/// ```
 #[derive(Clone)]
 pub struct CancelFlag {
     inner: Arc<AtomicBool>,
 }
 
 impl CancelFlag {
+    /// Creates a fresh flag in the non-cancelled state.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Signals all listeners that cancellation has been requested.
     pub fn cancel(&self) {
         self.inner.store(true, AtomicOrdering::Relaxed);
     }
 
+    /// Returns whether the flag has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.inner.load(AtomicOrdering::Relaxed)
     }
 }
 
+/// Thread-safe cache of directory scan results.
+///
+/// ```rust
+/// use foldersizer_cli::context::ScanCache;
+/// use foldersizer_cli::model::ScanMode;
+///
+/// let cache = ScanCache::default();
+/// assert!(cache.get(std::path::Path::new("."), ScanMode::Fast, None).is_none());
+/// ```
 #[derive(Default)]
 pub struct ScanCache {
     inner: Mutex<HashMap<PathBuf, Vec<CachedReport>>>,
 }
 
 impl ScanCache {
+    /// Retrieves a cached directory report for the same mode and modification time.
     pub fn get(
         &self,
         path: &Path,
@@ -49,6 +72,7 @@ impl ScanCache {
         })
     }
 
+    /// Stores a freshly produced directory report in the cache.
     pub fn insert(
         &self,
         path: PathBuf,
@@ -79,42 +103,7 @@ struct Visited {
     seen: Mutex<HashSet<PathBuf>>,
 }
 
-#[derive(Clone)]
-pub struct IoGate {
-    inner: Arc<(Mutex<usize>, Condvar)>,
-}
-
-pub struct IoPermit {
-    gate: IoGate,
-}
-
-impl IoGate {
-    pub fn new(permits: usize) -> Self {
-        Self {
-            inner: Arc::new((Mutex::new(permits), Condvar::new())),
-        }
-    }
-
-    pub fn acquire(&self) -> IoPermit {
-        let (lock, cvar) = &*self.inner;
-        let mut guard = lock.lock().unwrap();
-        while *guard == 0 {
-            guard = cvar.wait(guard).unwrap();
-        }
-        *guard -= 1;
-        IoPermit { gate: self.clone() }
-    }
-}
-
-impl Drop for IoPermit {
-    fn drop(&mut self) {
-        let (lock, cvar) = &*self.gate.inner;
-        let mut guard = lock.lock().unwrap();
-        *guard += 1;
-        cvar.notify_one();
-    }
-}
-
+/// Shared scanning context that exposes progress, caching, and cancellation helpers.
 #[derive(Clone)]
 pub struct ScanContext {
     options: ScanOptions,
@@ -122,17 +111,25 @@ pub struct ScanContext {
     visited: Arc<Visited>,
     progress: Option<Sender<ProgressEvent>>,
     cancel: CancelFlag,
-    io_gate: IoGate,
-    errors: ErrorStats,
 }
 
 impl ScanContext {
+    /// Builds a new context that can be shared between threads.
+    ///
+    /// ```rust
+    /// use foldersizer_cli::context::{CancelFlag, ScanContext};
+    /// use foldersizer_cli::model::{ScanMode, ScanOptions};
+    /// use std::sync::mpsc;
+    ///
+    /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
+    /// let (tx, _rx) = mpsc::channel();
+    /// let ctx = ScanContext::new(options, Some(tx), CancelFlag::new());
+    /// assert!(!ctx.cancel_flag().is_cancelled());
+    /// ```
     pub fn new(
         options: ScanOptions,
         progress: Option<Sender<ProgressEvent>>,
         cancel: CancelFlag,
-        io_gate: IoGate,
-        errors: ErrorStats,
     ) -> Self {
         Self {
             options,
@@ -140,40 +137,35 @@ impl ScanContext {
             visited: Arc::new(Visited::default()),
             progress,
             cancel,
-            io_gate,
-            errors,
         }
     }
 
+    /// Sends a progress event if a listener is registered.
     pub fn emit(&self, event: ProgressEvent) {
         if let Some(tx) = &self.progress {
             let _ = tx.send(event);
         }
     }
 
+    /// Returns `true` if the path has never been seen during this scan.
     pub fn mark_if_new(&self, path: PathBuf) -> bool {
         let mut guard = self.visited.seen.lock().unwrap();
         guard.insert(path)
     }
 
+    /// Exposes the scan options in use.
     pub fn options(&self) -> ScanOptions {
         self.options
     }
 
+    /// Provides access to the shared directory cache.
     pub fn cache(&self) -> &ScanCache {
         self.cache.as_ref()
     }
 
+    /// Returns the cancellation flag used by in-flight work.
     pub fn cancel_flag(&self) -> &CancelFlag {
         &self.cancel
-    }
-
-    pub fn errors(&self) -> &ErrorStats {
-        &self.errors
-    }
-
-    pub fn io_gate(&self) -> &IoGate {
-        &self.io_gate
     }
 }
 

@@ -1,5 +1,11 @@
 use crate::model::DirectoryReport;
 
+/// Formats a byte count using binary units.
+///
+/// ```rust
+/// use foldersizer_cli::report::format_size;
+/// assert_eq!(format_size(1024), "1.00 KiB");
+/// ```
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;
@@ -15,6 +21,21 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Prints a tabular directory report to STDOUT.
+///
+/// ```rust
+/// use foldersizer_cli::model::DirectoryReport;
+/// use foldersizer_cli::report::print_report;
+///
+/// let report = DirectoryReport {
+///     path: std::path::PathBuf::from("."),
+///     mtime: None,
+///     logical_size: 0,
+///     allocated_size: None,
+///     entries: Vec::new(),
+/// };
+/// print_report(&report);
+/// ```
 pub fn print_report(report: &DirectoryReport) {
     println!("Target: {}", report.path.display());
     println!("Logical total: {}", format_size(report.logical_size));

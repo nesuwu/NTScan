@@ -19,6 +19,19 @@ use crate::model::{
     AdsSummary, ChildJob, DirectoryPlan, DirectoryReport, EntryKind, EntryReport, ProgressEvent,
     ScanMode,
 };
+/// Performs a full directory scan and returns an aggregated report.
+///
+/// ```rust,no_run
+/// use foldersizer_cli::context::{CancelFlag, ScanContext};
+/// use foldersizer_cli::model::{ScanMode, ScanOptions};
+/// use foldersizer_cli::scanner::scan_directory;
+/// use std::sync::mpsc;
+///
+/// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
+/// let (tx, _rx) = mpsc::channel();
+/// let context = ScanContext::new(options, Some(tx), CancelFlag::new());
+/// let _report = scan_directory(std::path::Path::new("."), &context).unwrap();
+/// ```
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
@@ -103,6 +116,19 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 
     Ok(report)
 }
+/// Prepares the list of child directories and static entries before scanning.
+///
+/// ```rust,no_run
+/// use foldersizer_cli::context::{CancelFlag, ScanContext};
+/// use foldersizer_cli::model::{ScanMode, ScanOptions};
+/// use foldersizer_cli::scanner::prepare_directory_plan;
+/// use std::sync::mpsc;
+///
+/// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
+/// let (tx, _rx) = mpsc::channel();
+/// let context = ScanContext::new(options, Some(tx), CancelFlag::new());
+/// let _plan = prepare_directory_plan(std::path::Path::new("."), context.as_ref()).unwrap();
+/// ```
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
     let mut directories = Vec::new();
     let mut precomputed_entries = Vec::new();
@@ -215,6 +241,20 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         file_allocated,
     })
 }
+/// Scans a single queued child directory and returns its entry report.
+///
+/// ```rust,no_run
+/// use foldersizer_cli::context::{CancelFlag, ScanContext};
+/// use foldersizer_cli::model::{ChildJob, ScanMode, ScanOptions};
+/// use foldersizer_cli::scanner::process_directory_child;
+/// use std::sync::mpsc;
+///
+/// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
+/// let (tx, _rx) = mpsc::channel();
+/// let context = ScanContext::new(options, Some(tx), CancelFlag::new());
+/// let job = ChildJob { name: String::from("."), path: std::path::PathBuf::from("."), was_symlink: false };
+/// let _entry = process_directory_child(job, &context);
+/// ```
 pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryReport {
     if context.options().follow_symlinks && job.was_symlink {
         if let Ok(canon) = fs::canonicalize(&job.path) {

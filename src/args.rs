@@ -3,6 +3,15 @@ use std::path::PathBuf;
 
 use crate::model::ScanMode;
 
+/// Command-line arguments for the folder sizing tool.
+///
+/// ```rust
+/// use clap::Parser;
+/// use foldersizer_cli::args::Args;
+///
+/// let args = Args::parse_from(["foldersizer-cli", "./some/path"]);
+/// assert!(args.target.ends_with("some/path"));
+/// ```
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -34,6 +43,22 @@ pub struct Args {
 }
 
 impl Args {
+    /// Resolves the desired scanning mode based on the supplied flags.
+    ///
+    /// ```rust
+    /// use foldersizer_cli::args::Args;
+    /// use foldersizer_cli::model::ScanMode;
+    /// use std::path::PathBuf;
+    ///
+    /// let args = Args {
+    ///     target: PathBuf::from("."),
+    ///     fast: false,
+    ///     accurate: true,
+    ///     follow_symlinks: false,
+    ///     debug: false,
+    /// };
+    /// assert_eq!(args.resolve_mode(), ScanMode::Accurate);
+    /// ```
     pub fn resolve_mode(&self) -> ScanMode {
         if self.accurate && !self.fast {
             ScanMode::Accurate

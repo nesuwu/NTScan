@@ -13,13 +13,21 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use rayon::{ThreadPoolBuilder, prelude::*};
 
 use crate::args::Args;
-use crate::context::{CancelFlag, IoGate, ScanContext};
-use crate::model::ErrorStats;
-use crate::model::{DirectoryPlan, ProgressEvent, ScanMode, ScanOptions};
+use crate::context::{CancelFlag, ScanContext};
+use crate::model::{DirectoryPlan, ErrorStats, ProgressEvent, ScanMode, ScanOptions};
 use crate::report::{format_size, print_report};
 use crate::scanner::{prepare_directory_plan, process_directory_child, scan_directory};
 use crate::tui::{App, AppMessage, draw_app};
 
+/// Runs the CLI application by selecting the appropriate mode.
+///
+/// ```rust,no_run
+/// use crate::modes;
+///
+/// if let Err(err) = modes::run() {
+///     eprintln!("{err}");
+/// }
+/// ```
 pub fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -43,6 +51,17 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// Executes a streaming console run that prints progress to stderr.
+///
+/// ```rust,no_run
+/// use crate::args::Args;
+/// use crate::model::ScanOptions;
+/// use crate::modes::run_debug_mode;
+///
+/// let args = Args::parse_from(["foldersizer-cli", "--debug"]);
+/// let options = ScanOptions { mode: args.resolve_mode(), follow_symlinks: args.follow_symlinks };
+/// run_debug_mode(&args, options).unwrap();
+/// ```
 fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel();
     let printer = std::thread::spawn(move || {
@@ -80,16 +99,10 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         }
     });
 
-    let cancel = CancelFlag::new();
-    let io_gate = IoGate::new(16);
-    let errors = ErrorStats::default();
-
     let context = Arc::new(ScanContext::new(
         options,
         Some(progress_tx.clone()),
-        cancel,
-        io_gate,
-        errors,
+        CancelFlag::new(),
     ));
 
     if options.follow_symlinks {
@@ -109,6 +122,17 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
     Ok(())
 }
 
+/// Launches the interactive TUI run-loop.
+///
+/// ```rust,no_run
+/// use crate::args::Args;
+/// use crate::model::ScanOptions;
+/// use crate::modes::run_tui_mode;
+///
+/// let args = Args::parse_from(["foldersizer-cli"]);
+/// let options = ScanOptions { mode: args.resolve_mode(), follow_symlinks: args.follow_symlinks };
+/// run_tui_mode(&args, options).unwrap();
+/// ```
 fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -119,16 +143,9 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
 
     let result = (|| -> Result<()> {
         let cancel = CancelFlag::new();
-        let io_gate = IoGate::new(16);
         let errors = ErrorStats::default();
 
-        let context = Arc::new(ScanContext::new(
-            options,
-            None,
-            cancel.clone(),
-            io_gate.clone(),
-            errors.clone(),
-        ));
+        let context = Arc::new(ScanContext::new(options, None, cancel.clone()));
 
         if options.follow_symlinks {
             if let Ok(canon) = std::fs::canonicalize(&args.target) {
