@@ -204,7 +204,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             }
 
             terminal
-                .draw(|frame| draw_app(frame, &app))
+                .draw(|frame| draw_app(frame, &mut app))
                 .context("failed to draw frame")?;
 
             let timeout = tick_rate
