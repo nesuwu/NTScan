@@ -22,9 +22,9 @@ use crate::model::{
 /// Performs a full directory scan and returns an aggregated report.
 ///
 /// ```rust,no_run
-/// use foldersizer_cli::context::{CancelFlag, ScanContext};
-/// use foldersizer_cli::model::{ScanMode, ScanOptions};
-/// use foldersizer_cli::scanner::scan_directory;
+/// use ntscan::context::{CancelFlag, ScanContext};
+/// use ntscan::model::{ScanMode, ScanOptions};
+/// use ntscan::scanner::scan_directory;
 /// use std::sync::mpsc;
 ///
 /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
@@ -119,9 +119,9 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 /// Prepares the list of child directories and static entries before scanning.
 ///
 /// ```rust,no_run
-/// use foldersizer_cli::context::{CancelFlag, ScanContext};
-/// use foldersizer_cli::model::{ScanMode, ScanOptions};
-/// use foldersizer_cli::scanner::prepare_directory_plan;
+/// use ntscan::context::{CancelFlag, ScanContext};
+/// use ntscan::model::{ScanMode, ScanOptions};
+/// use ntscan::scanner::prepare_directory_plan;
 /// use std::sync::mpsc;
 ///
 /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
@@ -244,9 +244,9 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 /// Scans a single queued child directory and returns its entry report.
 ///
 /// ```rust,no_run
-/// use foldersizer_cli::context::{CancelFlag, ScanContext};
-/// use foldersizer_cli::model::{ChildJob, ScanMode, ScanOptions};
-/// use foldersizer_cli::scanner::process_directory_child;
+/// use ntscan::context::{CancelFlag, ScanContext};
+/// use ntscan::model::{ChildJob, ScanMode, ScanOptions};
+/// use ntscan::scanner::process_directory_child;
 /// use std::sync::mpsc;
 ///
 /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };

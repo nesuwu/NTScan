@@ -7,7 +7,7 @@ use crate::model::ScanMode;
 ///
 /// ```rust
 /// use clap::Parser;
-/// use foldersizer_cli::args::Args;
+/// use ntscan::args::Args;
 ///
 /// let args = Args::parse_from(["foldersizer-cli", "./some/path"]);
 /// assert!(args.target.ends_with("some/path"));
@@ -46,8 +46,8 @@ impl Args {
     /// Resolves the desired scanning mode based on the supplied flags.
     ///
     /// ```rust
-    /// use foldersizer_cli::args::Args;
-    /// use foldersizer_cli::model::ScanMode;
+    /// use ntscan::args::Args;
+    /// use ntscan::model::ScanMode;
     /// use std::path::PathBuf;
     ///
     /// let args = Args {

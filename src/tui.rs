@@ -34,7 +34,7 @@ enum DirectoryStatus {
 /// Messages exchanged between scanning workers and the UI.
 ///
 /// ```rust
-/// use foldersizer_cli::tui::AppMessage;
+/// use ntscan::tui::AppMessage;
 ///
 /// let msg = AppMessage::AllDone;
 /// matches!(msg, AppMessage::AllDone);
@@ -48,9 +48,9 @@ pub enum AppMessage {
 /// State container that drives the interactive TUI.
 ///
 /// ```rust,no_run
-/// use foldersizer_cli::context::CancelFlag;
-/// use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-/// use foldersizer_cli::tui::App;
+/// use ntscan::context::CancelFlag;
+/// use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+/// use ntscan::tui::App;
 ///
 /// let app = App::new(
 ///     std::path::PathBuf::from("."),
@@ -83,9 +83,9 @@ impl App {
     /// Constructs a new TUI state machine pinned to a target directory.
     ///
     /// ```rust,no_run
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -139,9 +139,9 @@ impl App {
     /// Applies a message produced by the worker threads to the UI state.
     ///
     /// ```rust
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::{App, AppMessage};
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::{App, AppMessage};
     /// let mut app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -166,9 +166,9 @@ impl App {
     ///
     /// ```rust
     /// # use crossterm::event::{KeyCode, KeyEvent};
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let mut app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -200,9 +200,9 @@ impl App {
     /// Advances periodic UI state such as timers.
     ///
     /// ```rust
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let mut app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -222,9 +222,9 @@ impl App {
     /// Indicates whether the UI loop should terminate.
     ///
     /// ```rust
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -244,9 +244,9 @@ impl App {
     /// Returns the combined logical size of all known entries.
     ///
     /// ```rust
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -280,9 +280,9 @@ impl App {
     /// Returns the aggregated on-disk allocation size when available.
     ///
     /// ```rust
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -318,9 +318,9 @@ impl App {
     /// Provides read-only access to the accumulated error statistics.
     ///
     /// ```rust
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanErrorKind, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanErrorKind, ScanMode};
+    /// # use ntscan::tui::App;
     /// let app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -340,9 +340,9 @@ impl App {
     /// Collapses the current state into a final directory report when complete.
     ///
     /// ```rust,no_run
-    /// # use foldersizer_cli::context::CancelFlag;
-    /// # use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use foldersizer_cli::tui::App;
+    /// # use ntscan::context::CancelFlag;
+    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+    /// # use ntscan::tui::App;
     /// let app = App::new(
     ///     std::path::PathBuf::from("."),
     ///     Vec::<ChildJob>::new(),
@@ -591,9 +591,9 @@ impl App {
 /// Renders the current application state into the provided frame.
 ///
 /// ```rust,ignore
-/// use foldersizer_cli::context::CancelFlag;
-/// use foldersizer_cli::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-/// use foldersizer_cli::tui::{draw_app, App};
+/// use ntscan::context::CancelFlag;
+/// use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
+/// use ntscan::tui::{draw_app, App};
 ///
 /// let app = App::new(
 ///     std::path::PathBuf::from("."),

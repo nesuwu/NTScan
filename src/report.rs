@@ -3,7 +3,7 @@ use crate::model::DirectoryReport;
 /// Formats a byte count using binary units.
 ///
 /// ```rust
-/// use foldersizer_cli::report::format_size;
+/// use ntscan::report::format_size;
 /// assert_eq!(format_size(1024), "1.00 KiB");
 /// ```
 pub fn format_size(bytes: u64) -> String {
@@ -24,8 +24,8 @@ pub fn format_size(bytes: u64) -> String {
 /// Prints a tabular directory report to STDOUT.
 ///
 /// ```rust
-/// use foldersizer_cli::model::DirectoryReport;
-/// use foldersizer_cli::report::print_report;
+/// use ntscan::model::DirectoryReport;
+/// use ntscan::report::print_report;
 ///
 /// let report = DirectoryReport {
 ///     path: std::path::PathBuf::from("."),

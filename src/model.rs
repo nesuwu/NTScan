@@ -6,7 +6,7 @@ use std::time::SystemTime;
 /// Available scanning strategies.
 ///
 /// ```rust
-/// use foldersizer_cli::model::ScanMode;
+/// use ntscan::model::ScanMode;
 /// assert_eq!(ScanMode::Fast.label(), "Fast");
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,7 +18,7 @@ pub enum ScanMode {
 /// Parameters supplied to every scan run.
 ///
 /// ```rust
-/// use foldersizer_cli::model::{ScanMode, ScanOptions};
+/// use ntscan::model::{ScanMode, ScanOptions};
 ///
 /// let opts = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
 /// assert!(!opts.follow_symlinks);
@@ -42,7 +42,7 @@ pub enum ScanErrorKind {
 /// Thread-safe accumulator for error statistics.
 ///
 /// ```rust
-/// use foldersizer_cli::model::{ErrorStats, ScanErrorKind};
+/// use ntscan::model::{ErrorStats, ScanErrorKind};
 ///
 /// let stats = ErrorStats::default();
 /// stats.record(ScanErrorKind::Other);

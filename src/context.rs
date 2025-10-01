@@ -10,7 +10,7 @@ use crate::model::{DirectoryReport, ProgressEvent, ScanMode, ScanOptions};
 /// Cooperative cancellation flag shared across scanner tasks.
 ///
 /// ```rust
-/// use foldersizer_cli::context::CancelFlag;
+/// use ntscan::context::CancelFlag;
 ///
 /// let flag = CancelFlag::new();
 /// assert!(!flag.is_cancelled());
@@ -44,8 +44,8 @@ impl CancelFlag {
 /// Thread-safe cache of directory scan results.
 ///
 /// ```rust
-/// use foldersizer_cli::context::ScanCache;
-/// use foldersizer_cli::model::ScanMode;
+/// use ntscan::context::ScanCache;
+/// use ntscan::model::ScanMode;
 ///
 /// let cache = ScanCache::default();
 /// assert!(cache.get(std::path::Path::new("."), ScanMode::Fast, None).is_none());
@@ -117,8 +117,8 @@ impl ScanContext {
     /// Builds a new context that can be shared between threads.
     ///
     /// ```rust
-    /// use foldersizer_cli::context::{CancelFlag, ScanContext};
-    /// use foldersizer_cli::model::{ScanMode, ScanOptions};
+    /// use ntscan::context::{CancelFlag, ScanContext};
+    /// use ntscan::model::{ScanMode, ScanOptions};
     /// use std::sync::mpsc;
     ///
     /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
