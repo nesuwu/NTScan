@@ -362,6 +362,7 @@ fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport>
     }
 
     let plan = prepare_directory_plan(path, context)?;
+
     let DirectoryPlan {
         directories,
         mut precomputed_entries,
@@ -636,7 +637,7 @@ fn get_allocated_size_fast(path: &Path) -> Result<u64> {
     let wide = path_to_wide(path);
     unsafe {
         let mut high: u32 = 0;
-        let low = GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), &mut high as *mut u32);
+        let low = GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), Some(&mut high as *mut u32));
         if low == u32::MAX {
             return get_allocated_size(path);
         }
@@ -904,7 +905,21 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         errors.clone(),
     ));
 
-    let mut app = App::new(
+    if options.follow_symlinks {
+        if let Ok(canon) = fs::canonicalize(&args.target) {
+            context.mark_if_new(canon);
+        }
+    }
+
+    let DirectoryPlan {
+        directories,
+        precomputed_entries,
+        file_logical,
+        file_allocated,
+    } = prepare_directory_plan(&args.target, context.as_ref())
+        .with_context(|| format!("failed to read {}", args.target.display()))?;
+
+    let _app = App::new(
         args.target.clone(),
         directories.clone(),
         precomputed_entries,
@@ -914,12 +929,6 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         cancel.clone(),
         errors.clone(),
     );
-
-    if options.follow_symlinks {
-        if let Ok(canon) = fs::canonicalize(&args.target) {
-            context.mark_if_new(canon);
-        }
-    }
 
     let report = scan_directory(&args.target, &context)
         .with_context(|| format!("failed to scan {}", args.target.display()))?;
@@ -1524,3 +1533,8 @@ impl ScanMode {
         }
     }
 }
+
+
+
+
+
