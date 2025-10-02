@@ -1,3 +1,4 @@
 TODO:
 
-[ ] Add a readme and license
+[ ] Add a **PROPER** readme
+[x] Add a license
