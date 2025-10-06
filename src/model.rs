@@ -5,6 +5,13 @@ use std::time::SystemTime;
 
 /// Available scanning strategies.
 ///
+/// * `Fast` performs a metadata-only walk that keeps syscalls to a minimum.
+///   It excels when you need a quick overview, but the figures omit NTFS
+///   allocation overhead and alternate data streams.
+/// * `Accurate` collects allocation size and enumerates every alternate data
+///   stream encountered. The results are precise, at the cost of additional
+///   I/O and a noticeably slower traversal.
+///
 /// ```rust
 /// use ntscan::model::ScanMode;
 /// assert_eq!(ScanMode::Fast.label(), "Fast");
@@ -88,6 +95,8 @@ pub struct EntryReport {
     pub ads_bytes: u64,
     pub ads_count: usize,
     pub error: Option<String>,
+    #[allow(dead_code)]
+    pub modified: Option<SystemTime>,
 }
 
 /// Classification for an entry appearing in the output.

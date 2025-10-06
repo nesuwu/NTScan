@@ -22,7 +22,7 @@ use crate::tui::{App, AppMessage, draw_app};
 /// Runs the CLI application by selecting the appropriate mode.
 ///
 /// ```rust,no_run
-/// use crate::modes;
+/// use ntscan::modes;
 ///
 /// if let Err(err) = modes::run() {
 ///     eprintln!("{err}");
@@ -53,12 +53,12 @@ pub fn run() -> Result<()> {
 
 /// Executes a streaming console run that prints progress to stderr.
 ///
-/// ```rust,no_run
-/// use crate::args::Args;
-/// use crate::model::ScanOptions;
-/// use crate::modes::run_debug_mode;
+/// ```rust,ignore
+/// use ntscan::args::Args;
+/// use ntscan::model::ScanOptions;
+/// use ntscan::modes::run_debug_mode;
 ///
-/// let args = Args::parse_from(["foldersizer-cli", "--debug"]);
+/// let args = Args::parse_from(["ntscan", "--debug"]);
 /// let options = ScanOptions { mode: args.resolve_mode(), follow_symlinks: args.follow_symlinks };
 /// run_debug_mode(&args, options).unwrap();
 /// ```
@@ -103,6 +103,7 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         options,
         Some(progress_tx.clone()),
         CancelFlag::new(),
+        ErrorStats::default(),
     ));
 
     if options.follow_symlinks {
@@ -124,12 +125,12 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
 
 /// Launches the interactive TUI run-loop.
 ///
-/// ```rust,no_run
-/// use crate::args::Args;
-/// use crate::model::ScanOptions;
-/// use crate::modes::run_tui_mode;
+/// ```rust,ignore
+/// use ntscan::args::Args;
+/// use ntscan::model::ScanOptions;
+/// use ntscan::modes::run_tui_mode;
 ///
-/// let args = Args::parse_from(["foldersizer-cli"]);
+/// let args = Args::parse_from(["ntscan"]);
 /// let options = ScanOptions { mode: args.resolve_mode(), follow_symlinks: args.follow_symlinks };
 /// run_tui_mode(&args, options).unwrap();
 /// ```
@@ -145,7 +146,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
         let cancel = CancelFlag::new();
         let errors = ErrorStats::default();
 
-        let context = Arc::new(ScanContext::new(options, None, cancel.clone()));
+        let context = Arc::new(ScanContext::new(
+            options,
+            None,
+            cancel.clone(),
+            errors.clone(),
+        ));
 
         if options.follow_symlinks {
             if let Ok(canon) = std::fs::canonicalize(&args.target) {

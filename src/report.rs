@@ -1,4 +1,5 @@
 use crate::model::DirectoryReport;
+use crate::util::fmt_bytes;
 
 /// Formats a byte count using binary units.
 ///
@@ -6,20 +7,7 @@ use crate::model::DirectoryReport;
 /// use ntscan::report::format_size;
 /// assert_eq!(format_size(1024), "1.00 KiB");
 /// ```
-pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
-    } else {
-        format!("{:.2} {}", value, UNITS[unit])
-    }
-}
+pub use crate::util::fmt_bytes as format_size;
 
 /// Prints a tabular directory report to STDOUT.
 ///
@@ -38,9 +26,9 @@ pub fn format_size(bytes: u64) -> String {
 /// ```
 pub fn print_report(report: &DirectoryReport) {
     println!("Target: {}", report.path.display());
-    println!("Logical total: {}", format_size(report.logical_size));
+    println!("Logical total: {}", fmt_bytes(report.logical_size));
     if let Some(allocated) = report.allocated_size {
-        println!("Allocated total: {}", format_size(allocated));
+        println!("Allocated total: {}", fmt_bytes(allocated));
     } else {
         println!("Allocated total: n/a (fast mode or partial data)");
     }
@@ -58,10 +46,10 @@ pub fn print_report(report: &DirectoryReport) {
     for entry in &report.entries {
         let allocated = entry
             .allocated_size
-            .map(format_size)
+            .map(fmt_bytes)
             .unwrap_or_else(|| String::from("-"));
         let ads_info = if entry.ads_count > 0 {
-            format_size(entry.ads_bytes)
+            fmt_bytes(entry.ads_bytes)
         } else {
             String::from("-")
         };
@@ -71,7 +59,7 @@ pub fn print_report(report: &DirectoryReport) {
             "{:<45} {:>7} {:>14} {:>14} {:>9} {:>8}",
             entry.name,
             label,
-            format_size(entry.logical_size),
+            fmt_bytes(entry.logical_size),
             allocated,
             ads_info,
             percent,

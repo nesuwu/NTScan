@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::model::{DirectoryReport, ProgressEvent, ScanMode, ScanOptions};
+use crate::model::{
+    DirectoryReport, ErrorStats, ProgressEvent, ScanErrorKind, ScanMode, ScanOptions,
+};
 
 /// Cooperative cancellation flag shared across scanner tasks.
 ///
@@ -22,6 +25,12 @@ pub struct CancelFlag {
     inner: Arc<AtomicBool>,
 }
 
+impl Default for CancelFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CancelFlag {
     /// Creates a fresh flag in the non-cancelled state.
     pub fn new() -> Self {
@@ -32,12 +41,12 @@ impl CancelFlag {
 
     /// Signals all listeners that cancellation has been requested.
     pub fn cancel(&self) {
-        self.inner.store(true, AtomicOrdering::Relaxed);
+        self.inner.store(true, AtomicOrdering::Release);
     }
 
     /// Returns whether the flag has been cancelled.
     pub fn is_cancelled(&self) -> bool {
-        self.inner.load(AtomicOrdering::Relaxed)
+        self.inner.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -81,7 +90,7 @@ impl ScanCache {
         report: DirectoryReport,
     ) {
         let mut guard = self.inner.lock().unwrap();
-        let records = guard.entry(path).or_insert_with(Vec::new);
+        let records = guard.entry(path).or_default();
         if let Some(existing) = records.iter_mut().find(|rec| rec.mode == mode) {
             *existing = CachedReport {
                 mode,
@@ -100,7 +109,20 @@ impl ScanCache {
 
 #[derive(Default)]
 struct Visited {
-    seen: Mutex<HashSet<PathBuf>>,
+    state: Mutex<VisitedState>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct VisitedState {
+    paths: HashSet<PathBuf>,
+    ids: HashSet<FileIdentity>,
+}
+
+#[cfg(not(windows))]
+#[derive(Default)]
+struct VisitedState {
+    paths: HashSet<PathBuf>,
 }
 
 /// Shared scanning context that exposes progress, caching, and cancellation helpers.
@@ -111,6 +133,7 @@ pub struct ScanContext {
     visited: Arc<Visited>,
     progress: Option<Sender<ProgressEvent>>,
     cancel: CancelFlag,
+    errors: ErrorStats,
 }
 
 impl ScanContext {
@@ -118,18 +141,19 @@ impl ScanContext {
     ///
     /// ```rust
     /// use ntscan::context::{CancelFlag, ScanContext};
-    /// use ntscan::model::{ScanMode, ScanOptions};
+    /// use ntscan::model::{ErrorStats, ScanMode, ScanOptions};
     /// use std::sync::mpsc;
     ///
     /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
     /// let (tx, _rx) = mpsc::channel();
-    /// let ctx = ScanContext::new(options, Some(tx), CancelFlag::new());
+    /// let ctx = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
     /// assert!(!ctx.cancel_flag().is_cancelled());
     /// ```
     pub fn new(
         options: ScanOptions,
         progress: Option<Sender<ProgressEvent>>,
         cancel: CancelFlag,
+        errors: ErrorStats,
     ) -> Self {
         Self {
             options,
@@ -137,6 +161,7 @@ impl ScanContext {
             visited: Arc::new(Visited::default()),
             progress,
             cancel,
+            errors,
         }
     }
 
@@ -149,8 +174,16 @@ impl ScanContext {
 
     /// Returns `true` if the path has never been seen during this scan.
     pub fn mark_if_new(&self, path: PathBuf) -> bool {
-        let mut guard = self.visited.seen.lock().unwrap();
-        guard.insert(path)
+        let normalized = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let identity = file_identity(&normalized).or_else(|| file_identity(&path));
+
+        let mut state = self.visited.state.lock().unwrap();
+        let by_path = state.paths.insert(normalized);
+        #[cfg(windows)]
+        let by_id = identity.map(|id| state.ids.insert(id)).unwrap_or(false);
+        #[cfg(not(windows))]
+        let by_id = identity.is_some();
+        by_path || by_id
     }
 
     /// Exposes the scan options in use.
@@ -167,10 +200,75 @@ impl ScanContext {
     pub fn cancel_flag(&self) -> &CancelFlag {
         &self.cancel
     }
+
+    /// Provides access to the shared error counters.
+    pub fn errors(&self) -> &ErrorStats {
+        &self.errors
+    }
+
+    /// Records an error using the shared statistics bucket.
+    pub fn record_error(&self, kind: ScanErrorKind) {
+        self.errors.record(kind);
+    }
 }
 
 struct CachedReport {
     mode: ScanMode,
     mtime: Option<SystemTime>,
     report: DirectoryReport,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct FileIdentity {
+    volume_serial: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+struct FileIdentity;
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+        };
+
+        let share_mode = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0;
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(share_mode)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)
+            .ok()?;
+
+        let mut info = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle() as isize),
+                FileIdInfo,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+            .ok()?;
+        }
+
+        Some(FileIdentity {
+            volume_serial: info.VolumeSerialNumber,
+            file_id: info.FileId.Identifier,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
 }

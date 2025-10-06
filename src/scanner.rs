@@ -1,12 +1,15 @@
 use std::cmp::Ordering;
 use std::ffi::c_void;
 use std::fs::{self, Metadata};
+use std::io;
 use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
-use windows::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_SHARING_VIOLATION, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
     FILE_STANDARD_INFO, FileStandardInfo, FindClose, FindFirstStreamW, FindNextStreamW,
     GetCompressedFileSizeW, GetFileInformationByHandleEx, STREAM_INFO_LEVELS,
@@ -17,25 +20,29 @@ use windows::core::{HRESULT, PCWSTR};
 use crate::context::ScanContext;
 use crate::model::{
     AdsSummary, ChildJob, DirectoryPlan, DirectoryReport, EntryKind, EntryReport, ProgressEvent,
-    ScanMode,
+    ScanErrorKind, ScanMode,
 };
 /// Performs a full directory scan and returns an aggregated report.
 ///
 /// ```rust,no_run
 /// use ntscan::context::{CancelFlag, ScanContext};
-/// use ntscan::model::{ScanMode, ScanOptions};
+/// use ntscan::model::{ErrorStats, ScanMode, ScanOptions};
 /// use ntscan::scanner::scan_directory;
 /// use std::sync::mpsc;
 ///
 /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
 /// let (tx, _rx) = mpsc::channel();
-/// let context = ScanContext::new(options, Some(tx), CancelFlag::new());
+/// let context = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
 /// let _report = scan_directory(std::path::Path::new("."), &context).unwrap();
 /// ```
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
     let metadata = fs::metadata(path)
+        .map_err(|err| {
+            context.record_error(classify_io_error(&err));
+            err
+        })
         .with_context(|| format!("metadata access failed for {}", path.display()))?;
     let mtime = metadata.modified().ok();
 
@@ -120,14 +127,14 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 ///
 /// ```rust,no_run
 /// use ntscan::context::{CancelFlag, ScanContext};
-/// use ntscan::model::{ScanMode, ScanOptions};
+/// use ntscan::model::{ErrorStats, ScanMode, ScanOptions};
 /// use ntscan::scanner::prepare_directory_plan;
 /// use std::sync::mpsc;
 ///
 /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
 /// let (tx, _rx) = mpsc::channel();
-/// let context = ScanContext::new(options, Some(tx), CancelFlag::new());
-/// let _plan = prepare_directory_plan(std::path::Path::new("."), context.as_ref()).unwrap();
+/// let context = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
+/// let _plan = prepare_directory_plan(std::path::Path::new("."), &context).unwrap();
 /// ```
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
     let mut directories = Vec::new();
@@ -139,16 +146,26 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     };
 
     let read_dir = fs::read_dir(path)
+        .map_err(|err| {
+            context.record_error(classify_io_error(&err));
+            err
+        })
         .with_context(|| format!("failed to read directory {}", path.display()))?;
 
     for entry in read_dir {
-        let entry = entry.with_context(|| format!("failed to iterate {}", path.display()))?;
+        let entry = entry
+            .map_err(|err| {
+                context.record_error(classify_io_error(&err));
+                err
+            })
+            .with_context(|| format!("failed to iterate {}", path.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         let entry_path = entry.path();
 
         let symlink_metadata = match fs::symlink_metadata(&entry_path) {
             Ok(meta) => meta,
             Err(err) => {
+                context.record_error(classify_io_error(&err));
                 context.emit(ProgressEvent::EntryError {
                     path: entry_path.clone(),
                     message: format!("symlink metadata error: {}", err),
@@ -171,6 +188,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
                     entry_path.clone(),
                     String::from("symlink not followed (use --follow-symlinks)"),
                 ));
+                context.record_error(ScanErrorKind::Other);
                 precomputed_entries.push(entry_with_error(
                     name,
                     entry_path.clone(),
@@ -182,6 +200,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             match fs::metadata(&entry_path) {
                 Ok(meta) => Some(meta),
                 Err(err) => {
+                    context.record_error(classify_io_error(&err));
                     context.emit(ProgressEvent::EntryError {
                         path: entry_path.clone(),
                         message: format!("symlink target metadata failed: {}", err),
@@ -232,6 +251,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             EntryKind::Other,
             "unsupported entry type",
         ));
+        context.record_error(ScanErrorKind::Other);
     }
 
     Ok(DirectoryPlan {
@@ -245,13 +265,13 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 ///
 /// ```rust,no_run
 /// use ntscan::context::{CancelFlag, ScanContext};
-/// use ntscan::model::{ChildJob, ScanMode, ScanOptions};
+/// use ntscan::model::{ChildJob, ErrorStats, ScanMode, ScanOptions};
 /// use ntscan::scanner::process_directory_child;
 /// use std::sync::mpsc;
 ///
 /// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
 /// let (tx, _rx) = mpsc::channel();
-/// let context = ScanContext::new(options, Some(tx), CancelFlag::new());
+/// let context = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
 /// let job = ChildJob { name: String::from("."), path: std::path::PathBuf::from("."), was_symlink: false };
 /// let _entry = process_directory_child(job, &context);
 /// ```
@@ -263,6 +283,7 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryRep
                     job.path.clone(),
                     String::from("cycle detected"),
                 ));
+                context.record_error(ScanErrorKind::Other);
                 return entry_with_error(
                     job.name,
                     job.path,
@@ -288,6 +309,7 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryRep
             ads_bytes: 0,
             ads_count: 0,
             error: None,
+            modified: report.mtime,
         },
         Err(err) => {
             context.emit(ProgressEvent::EntryError {
@@ -317,6 +339,7 @@ fn accumulate_file_sizes(
                 logical += ads.total_bytes;
             }
             Err(err) => {
+                context.record_error(ScanErrorKind::ADSFailed);
                 context.emit(ProgressEvent::EntryError {
                     path: path.to_path_buf(),
                     message: format!("ADS enumeration failed: {}", err),
@@ -329,6 +352,8 @@ fn accumulate_file_sizes(
                 allocated = Some(size);
             }
             Err(err) => {
+                let kind = classify_anyhow_error(&err);
+                context.record_error(kind);
                 context.emit(ProgressEvent::EntryError {
                     path: path.to_path_buf(),
                     message: format!("allocation size failed: {}", err),
@@ -367,6 +392,7 @@ fn entry_with_error(
         ads_bytes: 0,
         ads_count: 0,
         error: Some(message.into()),
+        modified: None,
     }
 }
 
@@ -487,4 +513,30 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
     wide
+}
+
+fn classify_io_error(err: &io::Error) -> ScanErrorKind {
+    #[cfg(windows)]
+    {
+        if let Some(code) = err.raw_os_error() {
+            if code == ERROR_ACCESS_DENIED.0 as i32 {
+                return ScanErrorKind::AccessDenied;
+            }
+            if code == ERROR_SHARING_VIOLATION.0 as i32 {
+                return ScanErrorKind::SharingViolation;
+            }
+        }
+    }
+    match err.kind() {
+        io::ErrorKind::PermissionDenied => ScanErrorKind::AccessDenied,
+        _ => ScanErrorKind::Other,
+    }
+}
+
+fn classify_anyhow_error(err: &anyhow::Error) -> ScanErrorKind {
+    if let Some(io_err) = err.downcast_ref::<io::Error>() {
+        classify_io_error(io_err)
+    } else {
+        ScanErrorKind::Other
+    }
 }

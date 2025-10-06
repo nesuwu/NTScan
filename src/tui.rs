@@ -1,7 +1,7 @@
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -17,6 +17,21 @@ use crate::model::{
     ChildJob, DirectoryReport, EntryKind, EntryReport, ErrorStats, ScanErrorKind, ScanMode,
 };
 use crate::report::format_size;
+use time::OffsetDateTime;
+use time::macros::format_description;
+
+const MODIFIED_FORMAT: &[time::format_description::FormatItem<'static>] =
+    format_description!("[year]-[month]-[day] [hour]:[minute]Z");
+
+fn format_modified(timestamp: Option<SystemTime>) -> (Option<SystemTime>, String) {
+    match timestamp {
+        Some(ts) => match OffsetDateTime::from(ts).format(MODIFIED_FORMAT) {
+            Ok(text) => (Some(ts), text),
+            Err(_) => (Some(ts), String::from("-")),
+        },
+        None => (None, String::from("-")),
+    }
+}
 #[derive(Clone)]
 struct AppDirectory {
     name: String,
@@ -49,22 +64,25 @@ pub enum AppMessage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SortMode {
-    LogicalDesc,
-    NameAsc,
+    Name,
+    Size,
+    Date,
 }
 
 impl SortMode {
     fn label(self) -> &'static str {
         match self {
-            SortMode::LogicalDesc => "size desc",
-            SortMode::NameAsc => "name asc",
+            SortMode::Name => "name ↑",
+            SortMode::Size => "size ↓",
+            SortMode::Date => "date ↓",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            SortMode::LogicalDesc => SortMode::NameAsc,
-            SortMode::NameAsc => SortMode::LogicalDesc,
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Date,
+            SortMode::Date => SortMode::Name,
         }
     }
 }
@@ -74,10 +92,12 @@ struct RowData {
     name: String,
     name_key: String,
     logical_sort: Option<u64>,
+    modified_sort: Option<SystemTime>,
     type_label: String,
     status: String,
     logical_text: String,
     allocated_text: String,
+    modified_text: String,
     ads_text: String,
     percent_text: String,
     style: Style,
@@ -107,6 +127,7 @@ impl RowData {
         } else {
             "-".to_string()
         };
+        let (modified_sort, modified_text) = format_modified(entry.modified);
         let percent_text = if total_logical > 0 {
             format!(
                 "{:.2}",
@@ -120,27 +141,36 @@ impl RowData {
             name,
             name_key,
             logical_sort: Some(entry.logical_size),
+            modified_sort,
             type_label: entry.kind.short_label().to_string(),
             status,
             logical_text,
             allocated_text,
+            modified_text,
             ads_text,
             percent_text,
             style,
         }
     }
 
-    fn into_row(self) -> Row<'static> {
+    fn into_row(self, highlighted: bool) -> Row<'static> {
+        let highlight_style = Style::default().add_modifier(Modifier::REVERSED);
+        let style = if highlighted {
+            self.style.patch(highlight_style)
+        } else {
+            self.style
+        };
         Row::new(vec![
             Cell::from(self.name),
             Cell::from(self.type_label),
             Cell::from(self.status),
             Cell::from(self.logical_text),
             Cell::from(self.allocated_text),
+            Cell::from(self.modified_text),
             Cell::from(self.ads_text),
             Cell::from(self.percent_text),
         ])
-        .style(self.style)
+        .style(style)
     }
 }
 
@@ -179,7 +209,8 @@ pub struct App {
     cancel: CancelFlag,
     errors: ErrorStats,
     sort_mode: SortMode,
-    scroll_offset: usize,
+    selected: usize,
+    offset: usize,
     last_viewport: usize,
 }
 impl App {
@@ -237,8 +268,9 @@ impl App {
             should_quit: false,
             cancel,
             errors,
-            sort_mode: SortMode::LogicalDesc,
-            scroll_offset: 0,
+            sort_mode: SortMode::Size,
+            selected: 0,
+            offset: 0,
             last_viewport: 0,
         }
     }
@@ -267,6 +299,8 @@ impl App {
             AppMessage::DirectoryFinished(report) => self.apply_report(report),
             AppMessage::AllDone => self.mark_all_done(),
         }
+        let total = self.total_rows();
+        self.ensure_selection_bounds(total);
     }
 
     /// Reacts to a keyboard event emitted by crossterm.
@@ -306,18 +340,100 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.cycle_sort();
             }
-            KeyCode::Down => self.scroll_line_down(),
-            KeyCode::Up => self.scroll_line_up(),
-            KeyCode::PageDown => self.scroll_page_down(),
-            KeyCode::PageUp => self.scroll_page_up(),
-            KeyCode::Home => self.scroll_to_top(),
-            KeyCode::End => self.scroll_to_bottom(),
+            KeyCode::Down => self.move_selection_by(1),
+            KeyCode::Up => self.move_selection_by(-1),
+            KeyCode::PageDown => self.move_page(1),
+            KeyCode::PageUp => self.move_page(-1),
+            KeyCode::Home => self.move_to_top(),
+            KeyCode::End => self.move_to_bottom(),
             _ => {}
         }
     }
 
     fn cycle_sort(&mut self) {
         self.sort_mode = self.sort_mode.next();
+        let total = self.total_rows();
+        self.ensure_selection_bounds(total);
+    }
+
+    fn total_rows(&self) -> usize {
+        let mut total = self.directories.len();
+        total += self
+            .static_entries
+            .iter()
+            .filter(|entry| {
+                !matches!(
+                    entry.kind,
+                    EntryKind::Directory | EntryKind::SymlinkDirectory
+                )
+            })
+            .count();
+        if self.file_logical > 0 {
+            total += 1;
+        }
+        total
+    }
+
+    fn ensure_selection_bounds(&mut self, total: usize) {
+        if total == 0 {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        if self.selected >= total {
+            self.selected = total - 1;
+        }
+        let viewport = self.last_viewport.max(1);
+        let max_offset = total.saturating_sub(viewport);
+        if self.offset > max_offset {
+            self.offset = max_offset;
+        }
+        if self.selected < self.offset {
+            self.offset = self.selected;
+        } else if self.selected >= self.offset + viewport {
+            self.offset = self.selected + 1 - viewport;
+        }
+    }
+
+    fn move_selection_by(&mut self, delta: isize) {
+        let total = self.total_rows();
+        if total == 0 {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        let current = self.selected.min(total - 1) as isize;
+        let max_index = (total - 1) as isize;
+        let next = (current + delta).clamp(0, max_index) as usize;
+        self.selected = next;
+        self.ensure_selection_bounds(total);
+    }
+
+    fn move_page(&mut self, delta: isize) {
+        let step = self.last_viewport.max(1) as isize;
+        self.move_selection_by(delta * step);
+    }
+
+    fn move_to_top(&mut self) {
+        let total = self.total_rows();
+        if total == 0 {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        self.selected = 0;
+        self.ensure_selection_bounds(total);
+    }
+
+    fn move_to_bottom(&mut self) {
+        let total = self.total_rows();
+        if total == 0 {
+            self.selected = 0;
+            self.offset = 0;
+            return;
+        }
+        self.selected = total - 1;
+        self.ensure_selection_bounds(total);
     }
 
     fn elapsed(&self) -> Duration {
@@ -325,32 +441,6 @@ impl App {
             Some(done) => done.duration_since(self.start),
             None => self.start.elapsed(),
         }
-    }
-
-    fn scroll_line_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(1);
-    }
-
-    fn scroll_line_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-    }
-
-    fn scroll_page_down(&mut self) {
-        let step = self.last_viewport.max(1);
-        self.scroll_offset = self.scroll_offset.saturating_add(step);
-    }
-
-    fn scroll_page_up(&mut self) {
-        let step = self.last_viewport.max(1);
-        self.scroll_offset = self.scroll_offset.saturating_sub(step);
-    }
-
-    fn scroll_to_top(&mut self) {
-        self.scroll_offset = 0;
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = usize::MAX;
     }
 
     /// Advances periodic UI state such as timers.
@@ -583,14 +673,22 @@ impl App {
     }
 
     fn apply_report(&mut self, report: EntryReport) {
-        for directory in &mut self.directories {
-            if directory.path == report.path {
-                directory.status = DirectoryStatus::Finished(report.clone());
-                self.completed_dirs += 1;
-                if self.completed_dirs == self.total_dirs && self.completed_at.is_none() {
-                    self.completed_at = Some(Instant::now());
+        let is_directory = matches!(
+            report.kind,
+            EntryKind::Directory | EntryKind::SymlinkDirectory
+        );
+        if is_directory {
+            let path = report.path.clone();
+            if let Some(directory) = self.directories.iter_mut().find(|dir| dir.path == path) {
+                let was_finished = matches!(directory.status, DirectoryStatus::Finished(_));
+                directory.status = DirectoryStatus::Finished(report);
+                if !was_finished {
+                    self.completed_dirs += 1;
+                    if self.completed_dirs == self.total_dirs && self.completed_at.is_none() {
+                        self.completed_at = Some(Instant::now());
+                    }
                 }
-                break;
+                return;
             }
         }
         self.static_entries.push(report);
@@ -622,10 +720,12 @@ impl App {
                         name,
                         name_key,
                         logical_sort: None,
+                        modified_sort: None,
                         type_label,
                         status: "WAIT".to_string(),
                         logical_text: "...".to_string(),
                         allocated_text: "...".to_string(),
+                        modified_text: "-".to_string(),
                         ads_text: "...".to_string(),
                         percent_text: "...".to_string(),
                         style: Style::default().fg(Color::DarkGray),
@@ -636,10 +736,12 @@ impl App {
                         name,
                         name_key,
                         logical_sort: None,
+                        modified_sort: None,
                         type_label,
                         status: "SCAN".to_string(),
                         logical_text: "...".to_string(),
                         allocated_text: "...".to_string(),
+                        modified_text: "-".to_string(),
                         ads_text: "...".to_string(),
                         percent_text: "...".to_string(),
                         style: Style::default()
@@ -672,6 +774,7 @@ impl App {
                 name: "[files]".to_string(),
                 name_key: "[files]".to_string(),
                 logical_sort: Some(self.file_logical),
+                modified_sort: None,
                 type_label: "FILE".to_string(),
                 status: "DONE".to_string(),
                 logical_text: format_size(self.file_logical),
@@ -679,6 +782,7 @@ impl App {
                     .file_allocated
                     .map(format_size)
                     .unwrap_or_else(|| "-".to_string()),
+                modified_text: "-".to_string(),
                 ads_text: "-".to_string(),
                 percent_text: if total_logical > 0 {
                     format!(
@@ -692,17 +796,29 @@ impl App {
             });
         }
 
-        rows.sort_by(|a, b| match self.sort_mode {
-            SortMode::LogicalDesc => {
-                let a_val = a.logical_sort.unwrap_or(0);
-                let b_val = b.logical_sort.unwrap_or(0);
-                match b_val.cmp(&a_val) {
-                    Ordering::Equal => a.name_key.cmp(&b.name_key),
-                    other => other,
-                }
+        match self.sort_mode {
+            SortMode::Name => {
+                rows.sort_by_key(|row| row.name_key.clone());
             }
-            SortMode::NameAsc => a.name_key.cmp(&b.name_key),
-        });
+            SortMode::Size => {
+                rows.sort_by_key(|row| {
+                    (
+                        row.logical_sort.is_none(),
+                        Reverse(row.logical_sort.unwrap_or(0)),
+                        row.name_key.clone(),
+                    )
+                });
+            }
+            SortMode::Date => {
+                rows.sort_by_key(|row| {
+                    (
+                        row.modified_sort.is_none(),
+                        Reverse(row.modified_sort.unwrap_or(UNIX_EPOCH)),
+                        row.name_key.clone(),
+                    )
+                });
+            }
+        }
 
         rows
     }
@@ -713,21 +829,23 @@ impl App {
         let total = data.len();
         self.last_viewport = viewport;
         if total == 0 {
-            self.scroll_offset = 0;
+            self.selected = 0;
+            self.offset = 0;
             return Vec::new();
         }
 
-        let max_offset = total.saturating_sub(viewport);
-        if self.scroll_offset > max_offset {
-            self.scroll_offset = max_offset;
-        }
+        self.ensure_selection_bounds(total);
 
-        let start = self.scroll_offset;
+        let start = self.offset;
         let end = (start + viewport).min(total);
         data[start..end]
             .iter()
             .cloned()
-            .map(RowData::into_row)
+            .enumerate()
+            .map(|(idx, row)| {
+                let absolute_index = start + idx;
+                row.into_row(absolute_index == self.selected)
+            })
             .collect()
     }
 }
@@ -785,7 +903,7 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
             "Errors - Cancelled:{}  ADS:{}  Access:{}  Share:{}  Other:{}",
             cncl, adsf, accd, shrv, othr
         )),
-        Line::from("Press q to quit | s to toggle sort"),
+        Line::from("Keys: q/Esc quit | s change sort | Up/Down move | PgUp/PgDn, Home/End page"),
     ];
 
     let header =
@@ -793,11 +911,12 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(header, chunks[0]);
 
     let column_widths = [
-        Constraint::Percentage(40),
+        Constraint::Percentage(35),
         Constraint::Length(6),
         Constraint::Length(8),
         Constraint::Length(14),
         Constraint::Length(14),
+        Constraint::Length(18),
         Constraint::Length(9),
         Constraint::Length(6),
     ];
@@ -810,6 +929,7 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
                 "Status",
                 "Logical",
                 "Allocated",
+                "Modified",
                 "ADS",
                 "%",
             ])

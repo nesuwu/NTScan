@@ -9,7 +9,7 @@ use crate::model::ScanMode;
 /// use clap::Parser;
 /// use ntscan::args::Args;
 ///
-/// let args = Args::parse_from(["foldersizer-cli", "./some/path"]);
+/// let args = Args::parse_from(["ntscan", "./some/path"]);
 /// assert!(args.target.ends_with("some/path"));
 /// ```
 #[derive(Parser, Debug)]
