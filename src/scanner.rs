@@ -39,9 +39,8 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
     let metadata = fs::metadata(path)
-        .map_err(|err| {
-            context.record_error(classify_io_error(&err));
-            err
+        .inspect_err(|err| {
+            context.record_error(classify_io_error(err));
         })
         .with_context(|| format!("metadata access failed for {}", path.display()))?;
     let mtime = metadata.modified().ok();
@@ -146,17 +145,15 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     };
 
     let read_dir = fs::read_dir(path)
-        .map_err(|err| {
-            context.record_error(classify_io_error(&err));
-            err
+        .inspect_err(|err| {
+            context.record_error(classify_io_error(err));
         })
         .with_context(|| format!("failed to read directory {}", path.display()))?;
 
     for entry in read_dir {
         let entry = entry
-            .map_err(|err| {
-                context.record_error(classify_io_error(&err));
-                err
+            .inspect_err(|err| {
+                context.record_error(classify_io_error(err));
             })
             .with_context(|| format!("failed to iterate {}", path.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -276,9 +273,9 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 /// let _entry = process_directory_child(job, &context);
 /// ```
 pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryReport {
-    if context.options().follow_symlinks && job.was_symlink {
-        if let Ok(canon) = fs::canonicalize(&job.path) {
-            if !context.mark_if_new(canon) {
+    if context.options().follow_symlinks && job.was_symlink
+        && let Ok(canon) = fs::canonicalize(&job.path)
+            && !context.mark_if_new(canon) {
                 context.emit(ProgressEvent::Skipped(
                     job.path.clone(),
                     String::from("cycle detected"),
@@ -291,8 +288,6 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryRep
                     "skipped (already visited target)",
                 );
             }
-        }
-    }
 
     match scan_directory(&job.path, context) {
         Ok(report) => EntryReport {
@@ -459,15 +454,14 @@ fn collect_ads(path: &Path) -> Result<AdsSummary> {
 }
 
 fn accumulate_stream(data: &WIN32_FIND_STREAM_DATA, summary: &mut AdsSummary) {
-    if let Some(name) = utf16_to_string(&data.cStreamName) {
-        if name != "::$DATA" {
-            let size = unsafe { *(&data.StreamSize as *const _ as *const i64) };
+    if let Some(name) = utf16_to_string(&data.cStreamName)
+        && name != "::$DATA" {
+            let size = data.StreamSize;
             if size > 0 {
                 summary.total_bytes += size as u64;
                 summary.count += 1;
             }
         }
-    }
 }
 
 struct HandleGuard {

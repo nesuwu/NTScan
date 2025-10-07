@@ -179,20 +179,32 @@ impl RowData {
 /// ```rust,no_run
 /// use ntscan::context::CancelFlag;
 /// use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-/// use ntscan::tui::App;
+/// use ntscan::tui::{App, AppParams};
 ///
-/// let app = App::new(
-///     std::path::PathBuf::from("."),
-///     Vec::<ChildJob>::new(),
-///     Vec::<EntryReport>::new(),
-///     0,
-///     None,
-///     ScanMode::Fast,
-///     CancelFlag::new(),
-///     ErrorStats::default(),
-/// );
+/// let params = AppParams {
+///     target: std::path::PathBuf::from("."),
+///     directories: Vec::<ChildJob>::new(),
+///     static_entries: Vec::<EntryReport>::new(),
+///     file_logical: 0,
+///     file_allocated: None,
+///     mode: ScanMode::Fast,
+///     cancel: CancelFlag::new(),
+///     errors: ErrorStats::default(),
+/// };
+/// let app = App::new(params);
 /// assert_eq!(app.total_logical(), 0);
 /// ```
+pub struct AppParams {
+    pub target: PathBuf,
+    pub directories: Vec<ChildJob>,
+    pub static_entries: Vec<EntryReport>,
+    pub file_logical: u64,
+    pub file_allocated: Option<u64>,
+    pub mode: ScanMode,
+    pub cancel: CancelFlag,
+    pub errors: ErrorStats,
+}
+
 pub struct App {
     target: PathBuf,
     mode: ScanMode,
@@ -219,29 +231,31 @@ impl App {
     /// ```rust,no_run
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let params = AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// };
+    /// let app = App::new(params);
     /// assert_eq!(app.total_logical(), 0);
     /// ```
-    pub fn new(
-        target: PathBuf,
-        directories: Vec<ChildJob>,
-        static_entries: Vec<EntryReport>,
-        file_logical: u64,
-        file_allocated: Option<u64>,
-        mode: ScanMode,
-        cancel: CancelFlag,
-        errors: ErrorStats,
-    ) -> Self {
+    pub fn new(params: AppParams) -> Self {
+        let AppParams {
+            target,
+            directories,
+            static_entries,
+            file_logical,
+            file_allocated,
+            mode,
+            cancel,
+            errors,
+        } = params;
         let total_dirs = directories.len();
         let directories = directories
             .into_iter()
@@ -280,17 +294,18 @@ impl App {
     /// ```rust
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppMessage};
-    /// let mut app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppMessage, AppParams};
+    /// let params = AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// };
+    /// let mut app = App::new(params);
     /// app.handle_message(AppMessage::AllDone);
     /// ```
     pub fn handle_message(&mut self, message: AppMessage) {
@@ -309,17 +324,17 @@ impl App {
     /// # use crossterm::event::{KeyCode, KeyEvent};
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let mut app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let mut app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// app.handle_key(KeyEvent::from(KeyCode::Char('q')));
     /// ```
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -448,17 +463,17 @@ impl App {
     /// ```rust
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let mut app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let mut app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// app.tick();
     /// ```
     pub fn tick(&mut self) {
@@ -470,17 +485,17 @@ impl App {
     /// ```rust
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// assert!(!app.should_exit());
     /// ```
     pub fn should_exit(&self) -> bool {
@@ -492,17 +507,17 @@ impl App {
     /// ```rust
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// assert_eq!(app.total_logical(), 0);
     /// ```
     pub fn total_logical(&self) -> u64 {
@@ -528,17 +543,17 @@ impl App {
     /// ```rust
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     Some(0),
-    ///     ScanMode::Accurate,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: Some(0),
+    ///     mode: ScanMode::Accurate,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// assert!(app.total_allocated().is_some());
     /// ```
     pub fn total_allocated(&self) -> Option<u64> {
@@ -566,17 +581,17 @@ impl App {
     /// ```rust
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanErrorKind, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// assert_eq!(app.errors().snapshot().get(&ScanErrorKind::Other), None);
     /// ```
     pub fn errors(&self) -> &ErrorStats {
@@ -588,17 +603,17 @@ impl App {
     /// ```rust,no_run
     /// # use ntscan::context::CancelFlag;
     /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::App;
-    /// let app = App::new(
-    ///     std::path::PathBuf::from("."),
-    ///     Vec::<ChildJob>::new(),
-    ///     Vec::<EntryReport>::new(),
-    ///     0,
-    ///     None,
-    ///     ScanMode::Fast,
-    ///     CancelFlag::new(),
-    ///     ErrorStats::default(),
-    /// );
+    /// # use ntscan::tui::{App, AppParams};
+    /// let app = App::new(AppParams {
+    ///     target: std::path::PathBuf::from("."),
+    ///     directories: Vec::<ChildJob>::new(),
+    ///     static_entries: Vec::<EntryReport>::new(),
+    ///     file_logical: 0,
+    ///     file_allocated: None,
+    ///     mode: ScanMode::Fast,
+    ///     cancel: CancelFlag::new(),
+    ///     errors: ErrorStats::default(),
+    /// });
     /// assert!(app.build_final_report().is_none());
     /// ```
     pub fn build_final_report(&self) -> Option<DirectoryReport> {
@@ -855,18 +870,18 @@ impl App {
 /// ```rust,ignore
 /// use ntscan::context::CancelFlag;
 /// use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-/// use ntscan::tui::{draw_app, App};
+/// use ntscan::tui::{draw_app, App, AppParams};
 ///
-/// let app = App::new(
-///     std::path::PathBuf::from("."),
-///     Vec::<ChildJob>::new(),
-///     Vec::<EntryReport>::new(),
-///     0,
-///     None,
-///     ScanMode::Fast,
-///     CancelFlag::new(),
-///     ErrorStats::default(),
-/// );
+/// let mut app = App::new(AppParams {
+///     target: std::path::PathBuf::from("."),
+///     directories: Vec::<ChildJob>::new(),
+///     static_entries: Vec::<EntryReport>::new(),
+///     file_logical: 0,
+///     file_allocated: None,
+///     mode: ScanMode::Fast,
+///     cancel: CancelFlag::new(),
+///     errors: ErrorStats::default(),
+/// });
 /// // call `draw_app(frame, &app)` inside a ratatui `Terminal::draw` callback
 /// ```
 pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {

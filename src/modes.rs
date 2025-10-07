@@ -17,7 +17,7 @@ use crate::context::{CancelFlag, ScanContext};
 use crate::model::{DirectoryPlan, ErrorStats, ProgressEvent, ScanMode, ScanOptions};
 use crate::report::{format_size, print_report};
 use crate::scanner::{prepare_directory_plan, process_directory_child, scan_directory};
-use crate::tui::{App, AppMessage, draw_app};
+use crate::tui::{App, AppMessage, AppParams, draw_app};
 
 /// Runs the CLI application by selecting the appropriate mode.
 ///
@@ -106,11 +106,10 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         ErrorStats::default(),
     ));
 
-    if options.follow_symlinks {
-        if let Ok(canon) = std::fs::canonicalize(&args.target) {
+    if options.follow_symlinks
+        && let Ok(canon) = std::fs::canonicalize(&args.target) {
             context.mark_if_new(canon);
         }
-    }
 
     let report = scan_directory(&args.target, &context)
         .with_context(|| format!("failed to scan {}", args.target.display()))?;
@@ -153,11 +152,10 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             errors.clone(),
         ));
 
-        if options.follow_symlinks {
-            if let Ok(canon) = std::fs::canonicalize(&args.target) {
+        if options.follow_symlinks
+            && let Ok(canon) = std::fs::canonicalize(&args.target) {
                 context.mark_if_new(canon);
             }
-        }
 
         let DirectoryPlan {
             directories,
@@ -167,16 +165,17 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
         } = prepare_directory_plan(&args.target, context.as_ref())
             .with_context(|| format!("failed to read {}", args.target.display()))?;
 
-        let mut app = App::new(
-            args.target.clone(),
-            directories.clone(),
-            precomputed_entries,
+        let app_params = AppParams {
+            target: args.target.clone(),
+            directories: directories.clone(),
+            static_entries: precomputed_entries,
             file_logical,
             file_allocated,
-            options.mode,
-            cancel.clone(),
-            errors.clone(),
-        );
+            mode: options.mode,
+            cancel: cancel.clone(),
+            errors: errors.clone(),
+        };
+        let mut app = App::new(app_params);
 
         let (msg_tx, msg_rx) = mpsc::channel();
 
@@ -216,11 +215,10 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             let timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_millis(0));
-            if event::poll(timeout).context("failed to poll for events")? {
-                if let Event::Key(key) = event::read().context("failed to read event")? {
+            if event::poll(timeout).context("failed to poll for events")?
+                && let Event::Key(key) = event::read().context("failed to read event")? {
                     app.handle_key(key);
                 }
-            }
 
             if last_tick.elapsed() >= tick_rate {
                 app.tick();
