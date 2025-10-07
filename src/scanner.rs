@@ -273,21 +273,23 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 /// let _entry = process_directory_child(job, &context);
 /// ```
 pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryReport {
-    if context.options().follow_symlinks && job.was_symlink
+    if context.options().follow_symlinks
+        && job.was_symlink
         && let Ok(canon) = fs::canonicalize(&job.path)
-            && !context.mark_if_new(canon) {
-                context.emit(ProgressEvent::Skipped(
-                    job.path.clone(),
-                    String::from("cycle detected"),
-                ));
-                context.record_error(ScanErrorKind::Other);
-                return entry_with_error(
-                    job.name,
-                    job.path,
-                    EntryKind::SymlinkDirectory,
-                    "skipped (already visited target)",
-                );
-            }
+        && !context.mark_if_new(canon)
+    {
+        context.emit(ProgressEvent::Skipped(
+            job.path.clone(),
+            String::from("cycle detected"),
+        ));
+        context.record_error(ScanErrorKind::Other);
+        return entry_with_error(
+            job.name,
+            job.path,
+            EntryKind::SymlinkDirectory,
+            "skipped (already visited target)",
+        );
+    }
 
     match scan_directory(&job.path, context) {
         Ok(report) => EntryReport {
@@ -455,13 +457,14 @@ fn collect_ads(path: &Path) -> Result<AdsSummary> {
 
 fn accumulate_stream(data: &WIN32_FIND_STREAM_DATA, summary: &mut AdsSummary) {
     if let Some(name) = utf16_to_string(&data.cStreamName)
-        && name != "::$DATA" {
-            let size = data.StreamSize;
-            if size > 0 {
-                summary.total_bytes += size as u64;
-                summary.count += 1;
-            }
+        && name != "::$DATA"
+    {
+        let size = data.StreamSize;
+        if size > 0 {
+            summary.total_bytes += size as u64;
+            summary.count += 1;
         }
+    }
 }
 
 struct HandleGuard {

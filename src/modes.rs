@@ -107,9 +107,10 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
     ));
 
     if options.follow_symlinks
-        && let Ok(canon) = std::fs::canonicalize(&args.target) {
-            context.mark_if_new(canon);
-        }
+        && let Ok(canon) = std::fs::canonicalize(&args.target)
+    {
+        context.mark_if_new(canon);
+    }
 
     let report = scan_directory(&args.target, &context)
         .with_context(|| format!("failed to scan {}", args.target.display()))?;
@@ -153,9 +154,10 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
         ));
 
         if options.follow_symlinks
-            && let Ok(canon) = std::fs::canonicalize(&args.target) {
-                context.mark_if_new(canon);
-            }
+            && let Ok(canon) = std::fs::canonicalize(&args.target)
+        {
+            context.mark_if_new(canon);
+        }
 
         let DirectoryPlan {
             directories,
@@ -216,9 +218,10 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_millis(0));
             if event::poll(timeout).context("failed to poll for events")?
-                && let Event::Key(key) = event::read().context("failed to read event")? {
-                    app.handle_key(key);
-                }
+                && let Event::Key(key) = event::read().context("failed to read event")?
+            {
+                app.handle_key(key);
+            }
 
             if last_tick.elapsed() >= tick_rate {
                 app.tick();
