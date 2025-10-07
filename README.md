@@ -17,7 +17,7 @@ an interactive TUI that keeps the current progress front and centre.
 1. Install the latest stable Rust toolchain on Windows (`rustup default stable`).
 2. Clone the repository and fetch the dependencies:
    ```powershell
-   git clone https://github.com/nesuf/NTScan.git
+   git clone https://github.com/nesuwu/NTScan.git
    cd NTScan
    cargo fetch
    ```
