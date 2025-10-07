@@ -1,4 +1,4 @@
-# NTScan ![CI](https://github.com/nesuwu/NTScan/actions/workflows/rust.yml/badge.svg)
+# NTScan ![Build](https://github.com/nesuwu/NTScan/actions/workflows/rust.yml/badge.svg)
 
 NTScan is a Windows directory scanner focused on producing fast, aggregated
 size reports for NTFS volumes. It can operate in a traditional CLI mode or via
