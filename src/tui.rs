@@ -62,6 +62,17 @@ pub enum AppMessage {
     AllDone,
 }
 
+/// Commands emitted by the UI in response to user interaction.
+///
+/// ```rust
+/// use ntscan::tui::AppAction;
+/// let action = AppAction::ChangeDirectory(std::path::PathBuf::from("."));
+/// matches!(action, AppAction::ChangeDirectory(_));
+/// ```
+pub enum AppAction {
+    ChangeDirectory(PathBuf),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SortMode {
     Name,
@@ -88,6 +99,13 @@ impl SortMode {
 }
 
 #[derive(Clone)]
+enum RowOrigin {
+    Directory(PathBuf),
+    Entry(PathBuf, EntryKind),
+    Files,
+}
+
+#[derive(Clone)]
 struct RowData {
     name: String,
     name_key: String,
@@ -101,10 +119,11 @@ struct RowData {
     ads_text: String,
     percent_text: String,
     style: Style,
+    origin: RowOrigin,
 }
 
 impl RowData {
-    fn from_entry(entry: &EntryReport, total_logical: u64) -> Self {
+    fn from_entry(entry: &EntryReport, total_logical: u64, origin: RowOrigin) -> Self {
         let name = entry.name.clone();
         let name_key = name.to_lowercase();
         let status = if entry.error.is_some() {
@@ -150,6 +169,7 @@ impl RowData {
             ads_text,
             percent_text,
             style,
+            origin,
         }
     }
 
@@ -224,6 +244,8 @@ pub struct App {
     selected: usize,
     offset: usize,
     last_viewport: usize,
+    rows_cache: Vec<RowData>,
+    rows_dirty: bool,
 }
 impl App {
     /// Constructs a new TUI state machine pinned to a target directory.
@@ -286,6 +308,8 @@ impl App {
             selected: 0,
             offset: 0,
             last_viewport: 0,
+            rows_cache: Vec::new(),
+            rows_dirty: true,
         }
     }
 
@@ -314,6 +338,7 @@ impl App {
             AppMessage::DirectoryFinished(report) => self.apply_report(report),
             AppMessage::AllDone => self.mark_all_done(),
         }
+        self.rows_dirty = true;
         let total = self.total_rows();
         self.ensure_selection_bounds(total);
     }
@@ -335,38 +360,64 @@ impl App {
     ///     cancel: CancelFlag::new(),
     ///     errors: ErrorStats::default(),
     /// });
-    /// app.handle_key(KeyEvent::from(KeyCode::Char('q')));
+    /// assert!(app.handle_key(KeyEvent::from(KeyCode::Char('q'))).is_none());
     /// ```
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<AppAction> {
         if key.kind != KeyEventKind::Press {
-            return;
+            return None;
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
                 self.cancel.cancel();
                 self.errors.record(ScanErrorKind::Cancelled);
+                None
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 self.cancel.cancel();
                 self.errors.record(ScanErrorKind::Cancelled);
+                None
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.cycle_sort();
+                None
             }
-            KeyCode::Down => self.move_selection_by(1),
-            KeyCode::Up => self.move_selection_by(-1),
-            KeyCode::PageDown => self.move_page(1),
-            KeyCode::PageUp => self.move_page(-1),
-            KeyCode::Home => self.move_to_top(),
-            KeyCode::End => self.move_to_bottom(),
-            _ => {}
+            KeyCode::Down => {
+                self.move_selection_by(1);
+                None
+            }
+            KeyCode::Up => {
+                self.move_selection_by(-1);
+                None
+            }
+            KeyCode::PageDown => {
+                self.move_page(1);
+                None
+            }
+            KeyCode::PageUp => {
+                self.move_page(-1);
+                None
+            }
+            KeyCode::Home => {
+                self.move_to_top();
+                None
+            }
+            KeyCode::End => {
+                self.move_to_bottom();
+                None
+            }
+            KeyCode::Enter => self
+                .selected_directory_target()
+                .map(AppAction::ChangeDirectory),
+            KeyCode::Backspace => self.parent_directory().map(AppAction::ChangeDirectory),
+            _ => None,
         }
     }
 
     fn cycle_sort(&mut self) {
         self.sort_mode = self.sort_mode.next();
+        self.rows_dirty = true;
         let total = self.total_rows();
         self.ensure_selection_bounds(total);
     }
@@ -410,6 +461,18 @@ impl App {
         }
     }
 
+    fn selected_directory_target(&mut self) -> Option<PathBuf> {
+        self.ensure_rows();
+        if self.rows_cache.is_empty() {
+            return None;
+        }
+        let index = self.selected.min(self.rows_cache.len() - 1);
+        match &self.rows_cache[index].origin {
+            RowOrigin::Directory(path) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
     fn move_selection_by(&mut self, delta: isize) {
         let total = self.total_rows();
         if total == 0 {
@@ -449,6 +512,11 @@ impl App {
         }
         self.selected = total - 1;
         self.ensure_selection_bounds(total);
+    }
+
+    fn parent_directory(&self) -> Option<PathBuf> {
+        let mut parent = self.target.clone();
+        if parent.pop() { Some(parent) } else { None }
     }
 
     fn elapsed(&self) -> Duration {
@@ -598,6 +666,16 @@ impl App {
         &self.errors
     }
 
+    /// Returns the directory currently being scanned.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    /// Signals any in-flight work to stop.
+    pub fn request_cancel(&self) {
+        self.cancel.cancel();
+    }
+
     /// Collapses the current state into a final directory report when complete.
     ///
     /// ```rust,no_run
@@ -716,6 +794,13 @@ impl App {
         }
     }
 
+    fn ensure_rows(&mut self) {
+        if self.rows_dirty {
+            self.rows_cache = self.collect_rows();
+            self.rows_dirty = false;
+        }
+    }
+
     fn collect_rows(&self) -> Vec<RowData> {
         let mut rows: Vec<RowData> = Vec::new();
         let total_logical = self.total_logical();
@@ -744,6 +829,7 @@ impl App {
                         ads_text: "...".to_string(),
                         percent_text: "...".to_string(),
                         style: Style::default().fg(Color::DarkGray),
+                        origin: RowOrigin::Directory(directory.path.clone()),
                     });
                 }
                 DirectoryStatus::Running => {
@@ -762,10 +848,15 @@ impl App {
                         style: Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
+                        origin: RowOrigin::Directory(directory.path.clone()),
                     });
                 }
                 DirectoryStatus::Finished(report) => {
-                    let mut data = RowData::from_entry(report, total_logical);
+                    let mut data = RowData::from_entry(
+                        report,
+                        total_logical,
+                        RowOrigin::Directory(directory.path.clone()),
+                    );
                     data.name = name;
                     data.name_key = name_key;
                     data.type_label = type_label;
@@ -781,7 +872,11 @@ impl App {
             ) {
                 continue;
             }
-            rows.push(RowData::from_entry(entry, total_logical));
+            rows.push(RowData::from_entry(
+                entry,
+                total_logical,
+                RowOrigin::Entry(entry.path.clone(), entry.kind),
+            ));
         }
 
         if self.file_logical > 0 {
@@ -808,6 +903,7 @@ impl App {
                     "0.00".to_string()
                 },
                 style: Style::default().fg(Color::Green),
+                origin: RowOrigin::Files,
             });
         }
 
@@ -840,8 +936,8 @@ impl App {
 
     fn visible_rows(&mut self, viewport: usize) -> Vec<Row<'static>> {
         let viewport = viewport.max(1);
-        let data = self.collect_rows();
-        let total = data.len();
+        self.ensure_rows();
+        let total = self.rows_cache.len();
         self.last_viewport = viewport;
         if total == 0 {
             self.selected = 0;
@@ -853,15 +949,12 @@ impl App {
 
         let start = self.offset;
         let end = (start + viewport).min(total);
-        data[start..end]
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(idx, row)| {
-                let absolute_index = start + idx;
-                row.into_row(absolute_index == self.selected)
-            })
-            .collect()
+        let mut rows = Vec::with_capacity(end.saturating_sub(start));
+        for (idx, row) in self.rows_cache[start..end].iter().enumerate() {
+            let absolute_index = start + idx;
+            rows.push(row.clone().into_row(absolute_index == self.selected));
+        }
+        rows
     }
 }
 
@@ -918,7 +1011,9 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
             "Errors - Cancelled:{}  ADS:{}  Access:{}  Share:{}  Other:{}",
             cncl, adsf, accd, shrv, othr
         )),
-        Line::from("Keys: q/Esc quit | s change sort | Up/Down move | PgUp/PgDn, Home/End page"),
+        Line::from(
+            "Keys: q/Esc quit | Enter open dir | Backspace up | s change sort | Up/Down move | PgUp/PgDn, Home/End page",
+        ),
     ];
 
     let header =

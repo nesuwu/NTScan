@@ -155,9 +155,26 @@ impl ScanContext {
         cancel: CancelFlag,
         errors: ErrorStats,
     ) -> Self {
+        Self::with_cache(
+            options,
+            progress,
+            cancel,
+            errors,
+            Arc::new(ScanCache::default()),
+        )
+    }
+
+    /// Builds a context that reuses an existing directory cache.
+    pub fn with_cache(
+        options: ScanOptions,
+        progress: Option<Sender<ProgressEvent>>,
+        cancel: CancelFlag,
+        errors: ErrorStats,
+        cache: Arc<ScanCache>,
+    ) -> Self {
         Self {
             options,
-            cache: Arc::new(ScanCache::default()),
+            cache,
             visited: Arc::new(Visited::default()),
             progress,
             cancel,
