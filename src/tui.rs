@@ -101,7 +101,7 @@ impl SortMode {
 #[derive(Clone)]
 enum RowOrigin {
     Directory(PathBuf),
-    Entry(PathBuf, EntryKind),
+    Other,
     Files,
 }
 
@@ -872,11 +872,7 @@ impl App {
             ) {
                 continue;
             }
-            rows.push(RowData::from_entry(
-                entry,
-                total_logical,
-                RowOrigin::Entry(entry.path.clone(), entry.kind),
-            ));
+            rows.push(RowData::from_entry(entry, total_logical, RowOrigin::Other));
         }
 
         if self.file_logical > 0 {

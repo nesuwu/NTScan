@@ -169,12 +169,9 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             let mut requested_path: Option<PathBuf> = None;
             if event::poll(timeout).context("failed to poll for events")?
                 && let Event::Key(key) = event::read().context("failed to read event")?
+                && let Some(AppAction::ChangeDirectory(path)) = app.handle_key(key)
             {
-                if let Some(action) = app.handle_key(key) {
-                    if let AppAction::ChangeDirectory(path) = action {
-                        requested_path = Some(path);
-                    }
-                }
+                requested_path = Some(path);
             }
 
             if last_tick.elapsed() >= tick_rate {
