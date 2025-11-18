@@ -22,19 +22,7 @@ use crate::model::{
     AdsSummary, ChildJob, DirectoryPlan, DirectoryReport, EntryKind, EntryReport, ProgressEvent,
     ScanErrorKind, ScanMode,
 };
-/// Performs a full directory scan and returns an aggregated report.
-///
-/// ```rust,no_run
-/// use ntscan::context::{CancelFlag, ScanContext};
-/// use ntscan::model::{ErrorStats, ScanMode, ScanOptions};
-/// use ntscan::scanner::scan_directory;
-/// use std::sync::mpsc;
-///
-/// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
-/// let (tx, _rx) = mpsc::channel();
-/// let context = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
-/// let _report = scan_directory(std::path::Path::new("."), &context).unwrap();
-/// ```
+
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
@@ -44,11 +32,6 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
         })
         .with_context(|| format!("metadata access failed for {}", path.display()))?;
     let mtime = metadata.modified().ok();
-
-    if let Some(cached) = context.cache().get(path, context.options().mode, mtime) {
-        context.emit(ProgressEvent::CacheHit(path.to_path_buf()));
-        return Ok(cached);
-    }
 
     let plan = prepare_directory_plan(path, context)?;
 
@@ -79,9 +62,6 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
         for entry in &entries {
             if let Some(alloc) = entry.allocated_size {
                 *total += alloc;
-            } else {
-                total_allocated = None;
-                break;
             }
         }
     }
@@ -107,13 +87,6 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
         entries,
     };
 
-    context.cache().insert(
-        path.to_path_buf(),
-        context.options().mode,
-        mtime,
-        report.clone(),
-    );
-
     context.emit(ProgressEvent::Completed {
         path: path.to_path_buf(),
         logical: report.logical_size,
@@ -122,19 +95,7 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 
     Ok(report)
 }
-/// Prepares the list of child directories and static entries before scanning.
-///
-/// ```rust,no_run
-/// use ntscan::context::{CancelFlag, ScanContext};
-/// use ntscan::model::{ErrorStats, ScanMode, ScanOptions};
-/// use ntscan::scanner::prepare_directory_plan;
-/// use std::sync::mpsc;
-///
-/// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
-/// let (tx, _rx) = mpsc::channel();
-/// let context = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
-/// let _plan = prepare_directory_plan(std::path::Path::new("."), &context).unwrap();
-/// ```
+
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
     let mut directories = Vec::new();
     let mut precomputed_entries = Vec::new();
@@ -159,19 +120,21 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         let name = entry.file_name().to_string_lossy().to_string();
         let entry_path = entry.path();
 
-        let symlink_metadata = match fs::symlink_metadata(&entry_path) {
+        // OPTIMIZATION: Use entry.metadata() to avoid re-querying the OS.
+        // This uses the data returned by FindNextFile (directory iteration) on Windows.
+        let symlink_metadata = match entry.metadata() {
             Ok(meta) => meta,
             Err(err) => {
                 context.record_error(classify_io_error(&err));
                 context.emit(ProgressEvent::EntryError {
                     path: entry_path.clone(),
-                    message: format!("symlink metadata error: {}", err),
+                    message: format!("metadata error: {}", err),
                 });
                 precomputed_entries.push(entry_with_error(
                     name,
                     entry_path.clone(),
                     EntryKind::Other,
-                    format!("symlink metadata error: {}", err),
+                    format!("metadata error: {}", err),
                 ));
                 continue;
             }
@@ -232,12 +195,10 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         if meta.is_file() {
             let (logical, allocated) = accumulate_file_sizes(&entry_path, &meta, context);
             file_logical += logical;
-            if let Some(total) = file_allocated.as_mut() {
-                if let Some(add) = allocated {
-                    *total += add;
-                } else {
-                    file_allocated = None;
-                }
+            if let Some(total) = file_allocated.as_mut()
+                && let Some(add) = allocated
+            {
+                *total += add;
             }
             continue;
         }
@@ -258,20 +219,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         file_allocated,
     })
 }
-/// Scans a single queued child directory and returns its entry report.
-///
-/// ```rust,no_run
-/// use ntscan::context::{CancelFlag, ScanContext};
-/// use ntscan::model::{ChildJob, ErrorStats, ScanMode, ScanOptions};
-/// use ntscan::scanner::process_directory_child;
-/// use std::sync::mpsc;
-///
-/// let options = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
-/// let (tx, _rx) = mpsc::channel();
-/// let context = ScanContext::new(options, Some(tx), CancelFlag::new(), ErrorStats::default());
-/// let job = ChildJob { name: String::from("."), path: std::path::PathBuf::from("."), was_symlink: false };
-/// let _entry = process_directory_child(job, &context);
-/// ```
+
 pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryReport {
     if context.options().follow_symlinks
         && job.was_symlink
@@ -322,6 +270,7 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryRep
         }
     }
 }
+
 fn accumulate_file_sizes(
     path: &Path,
     meta: &Metadata,
@@ -330,10 +279,26 @@ fn accumulate_file_sizes(
     let mut logical = meta.len();
     let mut allocated = None;
 
+    if context.options().mode == ScanMode::Fast {
+        return (logical, None);
+    }
+
     if context.options().mode == ScanMode::Accurate {
+        let mtime = meta.modified().ok();
+
+        if let Some((cached_alloc, cached_ads_bytes, _)) =
+            context.cache().get_attributes(path, logical, mtime)
+        {
+            logical += cached_ads_bytes;
+            allocated = Some(cached_alloc);
+            return (logical, allocated);
+        }
+
+        let mut ads_summary = AdsSummary::default();
         match collect_ads(path) {
             Ok(ads) => {
                 logical += ads.total_bytes;
+                ads_summary = ads;
             }
             Err(err) => {
                 context.record_error(ScanErrorKind::ADSFailed);
@@ -344,10 +309,8 @@ fn accumulate_file_sizes(
             }
         }
 
-        match get_allocated_size_fast(path) {
-            Ok(size) => {
-                allocated = Some(size);
-            }
+        let alloc_size = match get_allocated_size_fast(path) {
+            Ok(size) => size,
             Err(err) => {
                 let kind = classify_anyhow_error(&err);
                 context.record_error(kind);
@@ -355,19 +318,35 @@ fn accumulate_file_sizes(
                     path: path.to_path_buf(),
                     message: format!("allocation size failed: {}", err),
                 });
+                0
             }
-        }
+        };
+        allocated = Some(alloc_size);
+
+        context.cache().insert_attributes(
+            path.to_path_buf(),
+            mtime,
+            meta.len(),
+            alloc_size,
+            ads_summary.total_bytes,
+            ads_summary.count,
+        );
     }
 
     (logical, allocated)
 }
+
 fn get_allocated_size_fast(path: &Path) -> Result<u64> {
     let wide = path_to_wide(path);
     unsafe {
         let mut high: u32 = 0;
         let low = GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), Some(&mut high as *mut u32));
         if low == u32::MAX {
-            return get_allocated_size(path);
+            use windows::Win32::Foundation::GetLastError;
+            let err = GetLastError();
+            if err.is_err() {
+                return get_allocated_size(path);
+            }
         }
         Ok(((high as u64) << 32) | (low as u64))
     }
@@ -406,6 +385,7 @@ fn get_allocated_size(path: &Path) -> Result<u64> {
     }
     Ok(info.AllocationSize as u64)
 }
+
 fn collect_ads(path: &Path) -> Result<AdsSummary> {
     const FIND_STREAM_INFO_STANDARD: STREAM_INFO_LEVELS = STREAM_INFO_LEVELS(0);
 

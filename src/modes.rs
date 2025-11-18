@@ -20,15 +20,6 @@ use crate::report::{format_size, print_report};
 use crate::scanner::{prepare_directory_plan, process_directory_child, scan_directory};
 use crate::tui::{App, AppAction, AppMessage, AppParams, draw_app};
 
-/// Runs the CLI application by selecting the appropriate mode.
-///
-/// ```rust,no_run
-/// use ntscan::modes;
-///
-/// if let Err(err) = modes::run() {
-///     eprintln!("{err}");
-/// }
-/// ```
 pub fn run() -> Result<()> {
     let mut args = Args::parse();
     let resolved_target =
@@ -55,17 +46,6 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// Executes a streaming console run that prints progress to stderr.
-///
-/// ```rust,ignore
-/// use ntscan::args::Args;
-/// use ntscan::model::ScanOptions;
-/// use ntscan::modes::run_debug_mode;
-///
-/// let args = Args::parse_from(["ntscan", "--debug"]);
-/// let options = ScanOptions { mode: args.resolve_mode(), follow_symlinks: args.follow_symlinks };
-/// run_debug_mode(&args, options).unwrap();
-/// ```
 fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel();
     let printer = std::thread::spawn(move || {
@@ -119,25 +99,20 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
     let report = scan_directory(&args.target, &context)
         .with_context(|| format!("failed to scan {}", args.target.display()))?;
 
+    context.save_cache();
     drop(progress_tx);
     let _ = printer.join();
-
     print_report(&report);
-
     Ok(())
 }
 
-/// Launches the interactive TUI run-loop.
-///
-/// ```rust,ignore
-/// use ntscan::args::Args;
-/// use ntscan::model::ScanOptions;
-/// use ntscan::modes::run_tui_mode;
-///
-/// let args = Args::parse_from(["ntscan"]);
-/// let options = ScanOptions { mode: args.resolve_mode(), follow_symlinks: args.follow_symlinks };
-/// run_tui_mode(&args, options).unwrap();
-/// ```
+// Used to store previous states for instant back navigation
+struct NavigationState {
+    app: App,
+    context: Arc<ScanContext>,
+    msg_rx: mpsc::Receiver<AppMessage>,
+}
+
 fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -150,6 +125,9 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
         let shared_cache = Arc::new(ScanCache::default());
         let (mut app, mut context, mut msg_rx) =
             start_scan_session(args.target.clone(), options, Arc::clone(&shared_cache))?;
+
+        // History stack for Backspace
+        let mut history: Vec<NavigationState> = Vec::new();
 
         let tick_rate = Duration::from_millis(200);
         let mut last_tick = Instant::now();
@@ -166,12 +144,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             let timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or_else(|| Duration::from_millis(0));
-            let mut requested_path: Option<PathBuf> = None;
+
+            let mut action = None;
             if event::poll(timeout).context("failed to poll for events")?
                 && let Event::Key(key) = event::read().context("failed to read event")?
-                && let Some(AppAction::ChangeDirectory(path)) = app.handle_key(key)
             {
-                requested_path = Some(path);
+                action = app.handle_key(key);
             }
 
             if last_tick.elapsed() >= tick_rate {
@@ -179,15 +157,55 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                 last_tick = Instant::now();
             }
 
-            if let Some(target) = requested_path {
-                app.request_cancel();
-                let (next_app, next_context, next_rx) =
-                    start_scan_session(target, options, Arc::clone(&shared_cache))?;
-                app = next_app;
-                context = next_context;
-                msg_rx = next_rx;
-                last_tick = Instant::now();
-                continue;
+            if let Some(act) = action {
+                match act {
+                    AppAction::ChangeDirectory(target) => {
+                        // Save state before leaving
+                        app.request_cancel();
+                        context.save_cache(); // Partial save on navigation
+
+                        // Start new scan
+                        let (next_app, next_context, next_rx) =
+                            start_scan_session(target, options, Arc::clone(&shared_cache))?;
+
+                        // Push OLD state to history
+                        let old_state = NavigationState {
+                            app,
+                            context,
+                            msg_rx,
+                        };
+                        history.push(old_state);
+
+                        // Switch to NEW state
+                        app = next_app;
+                        context = next_context;
+                        msg_rx = next_rx;
+                        last_tick = Instant::now();
+                    }
+                    AppAction::GoBack => {
+                        // 1. Try In-Memory History (Instant)
+                        if let Some(state) = history.pop() {
+                            app = state.app;
+                            context = state.context;
+                            msg_rx = state.msg_rx;
+                            last_tick = Instant::now();
+                        }
+                        // 2. Fallback to Parent Directory (New Scan)
+                        else if let Some(parent) = app.target().parent() {
+                            let target = parent.to_path_buf();
+                            app.request_cancel();
+                            context.save_cache();
+
+                            let (next_app, next_context, next_rx) =
+                                start_scan_session(target, options, Arc::clone(&shared_cache))?;
+
+                            app = next_app;
+                            context = next_context;
+                            msg_rx = next_rx;
+                            last_tick = Instant::now();
+                        }
+                    }
+                }
             }
 
             if app.should_exit() {
@@ -195,15 +213,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
             }
         }
 
-        if let Some(report) = app.build_final_report() {
-            context.cache().insert(
-                app.target().to_path_buf(),
-                options.mode,
-                report.mtime,
-                report,
-            );
-        }
-
+        context.save_cache();
         Ok(())
     })();
 

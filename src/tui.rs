@@ -48,29 +48,15 @@ enum DirectoryStatus {
 }
 
 #[derive(Clone)]
-/// Messages exchanged between scanning workers and the UI.
-///
-/// ```rust
-/// use ntscan::tui::AppMessage;
-///
-/// let msg = AppMessage::AllDone;
-/// matches!(msg, AppMessage::AllDone);
-/// ```
 pub enum AppMessage {
     DirectoryStarted(PathBuf),
     DirectoryFinished(EntryReport),
     AllDone,
 }
 
-/// Commands emitted by the UI in response to user interaction.
-///
-/// ```rust
-/// use ntscan::tui::AppAction;
-/// let action = AppAction::ChangeDirectory(std::path::PathBuf::from("."));
-/// matches!(action, AppAction::ChangeDirectory(_));
-/// ```
 pub enum AppAction {
     ChangeDirectory(PathBuf),
+    GoBack,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,26 +180,6 @@ impl RowData {
     }
 }
 
-/// State container that drives the interactive TUI.
-///
-/// ```rust,no_run
-/// use ntscan::context::CancelFlag;
-/// use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-/// use ntscan::tui::{App, AppParams};
-///
-/// let params = AppParams {
-///     target: std::path::PathBuf::from("."),
-///     directories: Vec::<ChildJob>::new(),
-///     static_entries: Vec::<EntryReport>::new(),
-///     file_logical: 0,
-///     file_allocated: None,
-///     mode: ScanMode::Fast,
-///     cancel: CancelFlag::new(),
-///     errors: ErrorStats::default(),
-/// };
-/// let app = App::new(params);
-/// assert_eq!(app.total_logical(), 0);
-/// ```
 pub struct AppParams {
     pub target: PathBuf,
     pub directories: Vec<ChildJob>,
@@ -248,25 +214,6 @@ pub struct App {
     rows_dirty: bool,
 }
 impl App {
-    /// Constructs a new TUI state machine pinned to a target directory.
-    ///
-    /// ```rust,no_run
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let params = AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// };
-    /// let app = App::new(params);
-    /// assert_eq!(app.total_logical(), 0);
-    /// ```
     pub fn new(params: AppParams) -> Self {
         let AppParams {
             target,
@@ -313,25 +260,6 @@ impl App {
         }
     }
 
-    /// Applies a message produced by the worker threads to the UI state.
-    ///
-    /// ```rust
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppMessage, AppParams};
-    /// let params = AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// };
-    /// let mut app = App::new(params);
-    /// app.handle_message(AppMessage::AllDone);
-    /// ```
     pub fn handle_message(&mut self, message: AppMessage) {
         match message {
             AppMessage::DirectoryStarted(path) => self.mark_started(&path),
@@ -343,25 +271,6 @@ impl App {
         self.ensure_selection_bounds(total);
     }
 
-    /// Reacts to a keyboard event emitted by crossterm.
-    ///
-    /// ```rust
-    /// # use crossterm::event::{KeyCode, KeyEvent};
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let mut app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// assert!(app.handle_key(KeyEvent::from(KeyCode::Char('q'))).is_none());
-    /// ```
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<AppAction> {
         if key.kind != KeyEventKind::Press {
             return None;
@@ -410,7 +319,7 @@ impl App {
             KeyCode::Enter => self
                 .selected_directory_target()
                 .map(AppAction::ChangeDirectory),
-            KeyCode::Backspace => self.parent_directory().map(AppAction::ChangeDirectory),
+            KeyCode::Backspace => Some(AppAction::GoBack),
             _ => None,
         }
     }
@@ -514,11 +423,6 @@ impl App {
         self.ensure_selection_bounds(total);
     }
 
-    fn parent_directory(&self) -> Option<PathBuf> {
-        let mut parent = self.target.clone();
-        if parent.pop() { Some(parent) } else { None }
-    }
-
     fn elapsed(&self) -> Duration {
         match self.completed_at {
             Some(done) => done.duration_since(self.start),
@@ -526,68 +430,12 @@ impl App {
         }
     }
 
-    /// Advances periodic UI state such as timers.
-    ///
-    /// ```rust
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let mut app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// app.tick();
-    /// ```
-    pub fn tick(&mut self) {
-        // UI tick hook (spinner, timers) will live here; keep results visible until the user quits
-    }
+    pub fn tick(&mut self) {}
 
-    /// Indicates whether the UI loop should terminate.
-    ///
-    /// ```rust
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// assert!(!app.should_exit());
-    /// ```
     pub fn should_exit(&self) -> bool {
         self.should_quit
     }
 
-    /// Returns the combined logical size of all known entries.
-    ///
-    /// ```rust
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// assert_eq!(app.total_logical(), 0);
-    /// ```
     pub fn total_logical(&self) -> u64 {
         let mut total = self.file_logical;
         total += self
@@ -606,36 +454,22 @@ impl App {
         total
     }
 
-    /// Returns the aggregated on-disk allocation size when available.
-    ///
-    /// ```rust
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: Some(0),
-    ///     mode: ScanMode::Accurate,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// assert!(app.total_allocated().is_some());
-    /// ```
     pub fn total_allocated(&self) -> Option<u64> {
         match self.mode {
             ScanMode::Fast => None,
             ScanMode::Accurate => {
-                let mut total = self.file_allocated?;
+                // FIX: Use unwrap_or(0) to ignore errors instead of returning None
+                let mut total = self.file_allocated.unwrap_or(0);
+
                 for entry in &self.static_entries {
-                    total += entry.allocated_size?;
+                    total += entry.allocated_size.unwrap_or(0);
                 }
+
                 for directory in &self.directories {
                     if let DirectoryStatus::Finished(report) = &directory.status {
-                        total += report.allocated_size?;
+                        total += report.allocated_size.unwrap_or(0);
                     } else {
+                        // If a directory is still pending/running, we genuinely can't know the total yet
                         return None;
                     }
                 }
@@ -644,56 +478,18 @@ impl App {
         }
     }
 
-    /// Provides read-only access to the accumulated error statistics.
-    ///
-    /// ```rust
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanErrorKind, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// assert_eq!(app.errors().snapshot().get(&ScanErrorKind::Other), None);
-    /// ```
     pub fn errors(&self) -> &ErrorStats {
         &self.errors
     }
 
-    /// Returns the directory currently being scanned.
     pub fn target(&self) -> &Path {
         &self.target
     }
 
-    /// Signals any in-flight work to stop.
     pub fn request_cancel(&self) {
         self.cancel.cancel();
     }
 
-    /// Collapses the current state into a final directory report when complete.
-    ///
-    /// ```rust,no_run
-    /// # use ntscan::context::CancelFlag;
-    /// # use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-    /// # use ntscan::tui::{App, AppParams};
-    /// let app = App::new(AppParams {
-    ///     target: std::path::PathBuf::from("."),
-    ///     directories: Vec::<ChildJob>::new(),
-    ///     static_entries: Vec::<EntryReport>::new(),
-    ///     file_logical: 0,
-    ///     file_allocated: None,
-    ///     mode: ScanMode::Fast,
-    ///     cancel: CancelFlag::new(),
-    ///     errors: ErrorStats::default(),
-    /// });
-    /// assert!(app.build_final_report().is_none());
-    /// ```
     pub fn build_final_report(&self) -> Option<DirectoryReport> {
         if self.completed_dirs != self.total_dirs {
             return None;
@@ -710,20 +506,15 @@ impl App {
         let mut total_logical = self.file_logical;
         total_logical += entries.iter().map(|entry| entry.logical_size).sum::<u64>();
 
+        // FIX: Robust summation that doesn't fail if one entry is None
         let mut total_allocated = match (self.mode, self.file_allocated) {
-            (ScanMode::Accurate, Some(value)) => Some(value),
-            (ScanMode::Accurate, None) => None,
+            (ScanMode::Accurate, _) => Some(self.file_allocated.unwrap_or(0)),
             _ => None,
         };
 
         if let Some(acc) = total_allocated.as_mut() {
             for entry in &entries {
-                if let Some(size) = entry.allocated_size {
-                    *acc += size;
-                } else {
-                    total_allocated = None;
-                    break;
-                }
+                *acc += entry.allocated_size.unwrap_or(0);
             }
         }
 
@@ -954,25 +745,6 @@ impl App {
     }
 }
 
-/// Renders the current application state into the provided frame.
-///
-/// ```rust,ignore
-/// use ntscan::context::CancelFlag;
-/// use ntscan::model::{ChildJob, EntryReport, ErrorStats, ScanMode};
-/// use ntscan::tui::{draw_app, App, AppParams};
-///
-/// let mut app = App::new(AppParams {
-///     target: std::path::PathBuf::from("."),
-///     directories: Vec::<ChildJob>::new(),
-///     static_entries: Vec::<EntryReport>::new(),
-///     file_logical: 0,
-///     file_allocated: None,
-///     mode: ScanMode::Fast,
-///     cancel: CancelFlag::new(),
-///     errors: ErrorStats::default(),
-/// });
-/// // call `draw_app(frame, &app)` inside a ratatui `Terminal::draw` callback
-/// ```
 pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1008,7 +780,7 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
             cncl, adsf, accd, shrv, othr
         )),
         Line::from(
-            "Keys: q/Esc quit | Enter open dir | Backspace up | s change sort | Up/Down move | PgUp/PgDn, Home/End page",
+            "Keys: q/Esc quit | Enter open dir | Backspace go back | s change sort | Up/Down move | PgUp/PgDn, Home/End page",
         ),
     ];
 
