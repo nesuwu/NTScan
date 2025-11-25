@@ -15,6 +15,7 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 
 use crate::args::Args;
 use crate::context::{CancelFlag, ScanCache, ScanContext};
+use crate::duplicates::{find_duplicates, print_duplicate_report};
 use crate::model::{DirectoryPlan, ErrorStats, ProgressEvent, ScanMode, ScanOptions};
 use crate::report::{format_size, print_report};
 use crate::scanner::{prepare_directory_plan, process_directory_child, scan_directory};
@@ -39,11 +40,20 @@ pub fn run() -> Result<()> {
         follow_symlinks: args.follow_symlinks,
     };
 
-    if args.debug {
+    if args.duplicates {
+        run_duplicates_mode(&args)
+    } else if args.debug {
         run_debug_mode(&args, options)
     } else {
         run_tui_mode(&args, options)
     }
+}
+
+fn run_duplicates_mode(args: &Args) -> Result<()> {
+    eprintln!("Scanning for duplicates in {}...", args.target.display());
+    let result = find_duplicates(&args.target, args.min_size)?;
+    print_duplicate_report(&result);
+    Ok(())
 }
 
 fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {

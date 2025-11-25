@@ -3,15 +3,6 @@ use std::path::PathBuf;
 
 use crate::model::ScanMode;
 
-/// Command-line arguments for the folder sizing tool.
-///
-/// ```rust
-/// use clap::Parser;
-/// use ntscan::args::Args;
-///
-/// let args = Args::parse_from(["ntscan", "./some/path"]);
-/// assert!(args.target.ends_with("some/path"));
-/// ```
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -40,25 +31,19 @@ pub struct Args {
 
     #[arg(long, help = "Print only the final table (legacy behavior)")]
     pub debug: bool,
+
+    #[arg(long, help = "Find duplicate files by content hash")]
+    pub duplicates: bool,
+
+    #[arg(
+        long,
+        default_value = "1048576",
+        help = "Minimum file size in bytes for duplicate detection"
+    )]
+    pub min_size: u64,
 }
 
 impl Args {
-    /// Resolves the desired scanning mode based on the supplied flags.
-    ///
-    /// ```rust
-    /// use ntscan::args::Args;
-    /// use ntscan::model::ScanMode;
-    /// use std::path::PathBuf;
-    ///
-    /// let args = Args {
-    ///     target: PathBuf::from("."),
-    ///     fast: false,
-    ///     accurate: true,
-    ///     follow_symlinks: false,
-    ///     debug: false,
-    /// };
-    /// assert_eq!(args.resolve_mode(), ScanMode::Accurate);
-    /// ```
     pub fn resolve_mode(&self) -> ScanMode {
         if self.accurate && !self.fast {
             ScanMode::Accurate

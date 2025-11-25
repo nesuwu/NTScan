@@ -160,11 +160,33 @@ pub struct AdsSummary {
 }
 
 impl ScanMode {
-    /// Human-readable label for the mode.
     pub fn label(self) -> &'static str {
         match self {
             ScanMode::Fast => "Fast",
             ScanMode::Accurate => "Accurate",
         }
     }
+}
+
+#[derive(Clone)]
+pub struct DuplicateGroup {
+    pub hash: [u8; 32],
+    pub size: u64,
+    pub paths: Vec<PathBuf>,
+}
+
+impl DuplicateGroup {
+    pub fn reclaimable_bytes(&self) -> u64 {
+        if self.paths.len() <= 1 {
+            0
+        } else {
+            self.size * (self.paths.len() as u64 - 1)
+        }
+    }
+}
+
+pub struct DuplicateScanResult {
+    pub groups: Vec<DuplicateGroup>,
+    pub total_files_scanned: u64,
+    pub total_reclaimable: u64,
 }

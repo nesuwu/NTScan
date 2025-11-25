@@ -1,5 +1,6 @@
 pub mod args;
 pub mod context;
+pub mod duplicates;
 pub mod model;
 pub mod modes;
 pub mod report;
