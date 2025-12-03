@@ -89,6 +89,7 @@ enum RowOrigin {
     Directory(PathBuf),
     Other,
     Files,
+    Parent,
 }
 
 #[derive(Clone)]
@@ -316,9 +317,7 @@ impl App {
                 self.move_to_bottom();
                 None
             }
-            KeyCode::Enter => self
-                .selected_directory_target()
-                .map(AppAction::ChangeDirectory),
+            KeyCode::Enter => self.activate_selection(),
             KeyCode::Backspace => Some(AppAction::GoBack),
             _ => None,
         }
@@ -346,6 +345,9 @@ impl App {
         if self.file_logical > 0 {
             total += 1;
         }
+        if self.target.parent().is_some() {
+            total += 1;
+        }
         total
     }
 
@@ -370,14 +372,15 @@ impl App {
         }
     }
 
-    fn selected_directory_target(&mut self) -> Option<PathBuf> {
+    fn activate_selection(&mut self) -> Option<AppAction> {
         self.ensure_rows();
         if self.rows_cache.is_empty() {
             return None;
         }
         let index = self.selected.min(self.rows_cache.len() - 1);
         match &self.rows_cache[index].origin {
-            RowOrigin::Directory(path) => Some(path.clone()),
+            RowOrigin::Directory(path) => Some(AppAction::ChangeDirectory(path.clone())),
+            RowOrigin::Parent => Some(AppAction::GoBack),
             _ => None,
         }
     }
@@ -716,6 +719,27 @@ impl App {
                     )
                 });
             }
+        }
+
+        if self.target.parent().is_some() {
+            rows.insert(
+                0,
+                RowData {
+                    name: "..".to_string(),
+                    name_key: "..".to_string(),
+                    logical_sort: None,
+                    modified_sort: None,
+                    type_label: "UP".to_string(),
+                    status: String::new(),
+                    logical_text: String::new(),
+                    allocated_text: String::new(),
+                    modified_text: String::new(),
+                    ads_text: String::new(),
+                    percent_text: String::new(),
+                    style: Style::default().fg(Color::Cyan),
+                    origin: RowOrigin::Parent,
+                },
+            );
         }
 
         rows

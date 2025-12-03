@@ -1,31 +1,266 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 use crate::model::{DuplicateGroup, DuplicateScanResult};
+
+const HASH_CACHE_MAGIC: &[u8; 8] = b"NTSH0001";
+
+struct HashCache {
+    entries: Mutex<HashMap<String, CachedHash>>,
+    dirty: std::sync::atomic::AtomicBool,
+    file_path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct CachedHash {
+    mtime_sec: u64,
+    mtime_nanos: u32,
+    size: u64,
+    hash: [u8; 32],
+}
+
+impl HashCache {
+    fn new() -> Self {
+        let file_path = if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let mut path = PathBuf::from(local_app_data);
+            path.push("ntscan");
+            let _ = fs::create_dir_all(&path);
+            path.push("hash_cache");
+            path
+        } else {
+            let mut path = std::env::temp_dir();
+            path.push("ntscan_hash.cache");
+            path
+        };
+
+        let mut cache = Self {
+            entries: Mutex::new(HashMap::new()),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            file_path,
+        };
+        let _ = cache.load();
+        cache
+    }
+
+    fn get(&self, path: &Path, size: u64, mtime: Option<SystemTime>) -> Option<[u8; 32]> {
+        let (mtime_sec, mtime_nanos) = system_time_to_tuple(mtime?);
+        let key = path.to_string_lossy().to_lowercase();
+        let guard = self.entries.lock().unwrap();
+        if let Some(entry) = guard.get(&key)
+            && entry.size == size
+            && entry.mtime_sec == mtime_sec
+            && entry.mtime_nanos == mtime_nanos
+        {
+            return Some(entry.hash);
+        }
+        None
+    }
+
+    fn insert(&self, path: &Path, size: u64, mtime: Option<SystemTime>, hash: [u8; 32]) {
+        let Some(mtime) = mtime else { return };
+        let (mtime_sec, mtime_nanos) = system_time_to_tuple(mtime);
+        let key = path.to_string_lossy().to_lowercase();
+        let entry = CachedHash {
+            mtime_sec,
+            mtime_nanos,
+            size,
+            hash,
+        };
+        self.entries.lock().unwrap().insert(key, entry);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn load(&mut self) -> Result<()> {
+        if !self.file_path.exists() {
+            return Ok(());
+        }
+        let file = File::open(&self.file_path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut magic = [0u8; 8];
+        if reader.read_exact(&mut magic).is_err() || &magic != HASH_CACHE_MAGIC {
+            return Ok(());
+        }
+
+        let mut buf8 = [0u8; 8];
+        if reader.read_exact(&mut buf8).is_err() {
+            return Ok(());
+        }
+        let count = u64::from_le_bytes(buf8);
+
+        let mut buf2 = [0u8; 2];
+        let mut guard = self.entries.lock().unwrap();
+
+        for _ in 0..count {
+            if reader.read_exact(&mut buf2).is_err() {
+                break;
+            }
+            let path_len = u16::from_le_bytes(buf2) as usize;
+
+            let mut path_buf = vec![0u8; path_len];
+            if reader.read_exact(&mut path_buf).is_err() {
+                break;
+            }
+            let key = String::from_utf8_lossy(&path_buf).to_string();
+
+            let mut data = [0u8; 52];
+            if reader.read_exact(&mut data).is_err() {
+                break;
+            }
+
+            let entry = CachedHash {
+                mtime_sec: u64::from_le_bytes(data[0..8].try_into().unwrap()),
+                mtime_nanos: u32::from_le_bytes(data[8..12].try_into().unwrap()),
+                size: u64::from_le_bytes(data[12..20].try_into().unwrap()),
+                hash: data[20..52].try_into().unwrap(),
+            };
+            guard.insert(key, entry);
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> Result<()> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let temp_path = self.file_path.with_extension("tmp");
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        writer.write_all(HASH_CACHE_MAGIC)?;
+
+        let guard = self.entries.lock().unwrap();
+        writer.write_all(&(guard.len() as u64).to_le_bytes())?;
+
+        for (key, entry) in guard.iter() {
+            let key_bytes = key.as_bytes();
+            if key_bytes.len() > u16::MAX as usize {
+                continue;
+            }
+            writer.write_all(&(key_bytes.len() as u16).to_le_bytes())?;
+            writer.write_all(key_bytes)?;
+            writer.write_all(&entry.mtime_sec.to_le_bytes())?;
+            writer.write_all(&entry.mtime_nanos.to_le_bytes())?;
+            writer.write_all(&entry.size.to_le_bytes())?;
+            writer.write_all(&entry.hash)?;
+        }
+
+        writer.flush()?;
+        drop(writer);
+        drop(guard);
+        let _ = fs::rename(temp_path, &self.file_path);
+        self.dirty.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn system_time_to_tuple(t: SystemTime) -> (u64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs(), d.subsec_nanos()),
+        Err(_) => (0, 0),
+    }
+}
+
+struct Progress {
+    total_candidates: u64,
+    hashed: AtomicU64,
+    cache_hits: AtomicU64,
+    bytes_hashed: AtomicU64,
+}
+
+impl Progress {
+    fn new(total: u64) -> Self {
+        Self {
+            total_candidates: total,
+            hashed: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            bytes_hashed: AtomicU64::new(0),
+        }
+    }
+
+    fn record_hash(&self, bytes: u64) {
+        let done = self.hashed.fetch_add(1, Ordering::Relaxed) + 1;
+        self.bytes_hashed.fetch_add(bytes, Ordering::Relaxed);
+        if done.is_multiple_of(50) || done == self.total_candidates {
+            self.print_status();
+        }
+    }
+
+    fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        let done = self.hashed.fetch_add(1, Ordering::Relaxed) + 1;
+        if done.is_multiple_of(50) || done == self.total_candidates {
+            self.print_status();
+        }
+    }
+
+    fn print_status(&self) {
+        let done = self.hashed.load(Ordering::Relaxed);
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        let bytes = self.bytes_hashed.load(Ordering::Relaxed);
+        eprint!(
+            "\rHashing: {}/{} files ({} cached, {} hashed)    ",
+            done,
+            self.total_candidates,
+            hits,
+            crate::util::fmt_bytes(bytes)
+        );
+    }
+}
 
 pub fn find_duplicates(root: &Path, min_size: u64) -> Result<DuplicateScanResult> {
     let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     let mut total_files_scanned: u64 = 0;
 
+    eprint!("Collecting files...\r");
     collect_files(root, min_size, &mut files_by_size, &mut total_files_scanned)?;
+    eprintln!(
+        "Collected {} files                    ",
+        total_files_scanned
+    );
 
     let candidates: Vec<(u64, Vec<PathBuf>)> = files_by_size
         .into_iter()
         .filter(|(_, paths)| paths.len() > 1)
         .collect();
 
+    let total_to_hash: u64 = candidates.iter().map(|(_, p)| p.len() as u64).sum();
+    eprintln!("Found {} potential duplicates to hash", total_to_hash);
+
+    let cache = HashCache::new();
+    let progress = Progress::new(total_to_hash);
     let mut groups: Vec<DuplicateGroup> = Vec::new();
 
     for (size, paths) in candidates {
         let mut by_hash: HashMap<[u8; 32], Vec<PathBuf>> = HashMap::new();
 
         for path in paths {
-            if let Ok(hash) = hash_file(&path) {
+            let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+
+            if let Some(hash) = cache.get(&path, size, mtime) {
+                progress.record_cache_hit();
                 by_hash.entry(hash).or_default().push(path);
+                continue;
+            }
+
+            match hash_file_sha256(&path) {
+                Ok(hash) => {
+                    progress.record_hash(size);
+                    cache.insert(&path, size, mtime, hash);
+                    by_hash.entry(hash).or_default().push(path);
+                }
+                Err(_) => {
+                    progress.record_hash(0);
+                }
             }
         }
 
@@ -36,7 +271,10 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Result<DuplicateScanResult
         }
     }
 
-    groups.sort_by(|a, b| b.reclaimable_bytes().cmp(&a.reclaimable_bytes()));
+    eprintln!();
+    let _ = cache.save();
+
+    groups.sort_by_key(|b| std::cmp::Reverse(b.reclaimable_bytes()));
 
     let total_reclaimable: u64 = groups.iter().map(|g| g.reclaimable_bytes()).sum();
 
@@ -79,39 +317,21 @@ fn collect_files(
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<[u8; 32]> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::Hasher;
-
+fn hash_file_sha256(path: &Path) -> Result<[u8; 32]> {
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    let mut hashers = [
-        DefaultHasher::new(),
-        DefaultHasher::new(),
-        DefaultHasher::new(),
-        DefaultHasher::new(),
-    ];
-    let mut buffer = [0u8; 32768];
-    let mut pos: usize = 0;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
 
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        for byte in &buffer[..bytes_read] {
-            hashers[pos % 4].write_u8(*byte);
-            pos += 1;
-        }
+        hasher.update(&buffer[..bytes_read]);
     }
 
-    let mut result = [0u8; 32];
-    for (i, h) in hashers.iter().enumerate() {
-        let hash = h.finish().to_le_bytes();
-        result[i * 8..(i + 1) * 8].copy_from_slice(&hash);
-    }
-
-    Ok(result)
+    Ok(hasher.finalize().into())
 }
 
 pub fn print_duplicate_report(result: &DuplicateScanResult) {
@@ -127,11 +347,13 @@ pub fn print_duplicate_report(result: &DuplicateScanResult) {
     println!();
 
     for (i, group) in result.groups.iter().enumerate() {
+        let hash_hex: String = group.hash.iter().map(|b| format!("{:02x}", b)).collect();
         println!(
-            "Group {} - {} ({} copies)",
+            "Group {} - {} ({} copies) [{}...]",
             i + 1,
             crate::util::fmt_bytes(group.size),
-            group.paths.len()
+            group.paths.len(),
+            &hash_hex[..16]
         );
         println!(
             "  Reclaimable: {}",
