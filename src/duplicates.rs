@@ -217,6 +217,18 @@ impl Progress {
     }
 }
 
+/// Scans a directory for duplicate files based on size and SHA-256 content hash.
+///
+/// # Algorithm
+///
+/// 1. **Size Grouping**: Recursively walks the directory to find all files larger than `min_size`.
+///    Files are grouped by their file size. Unique sizes are discarded immediately.
+/// 2. **Hashing**: For groups with multiple files, the content is hashed using SHA-256.
+///    A persistent on-disk cache is used to avoid re-hashing unchanged files.
+/// 3. **Verification**: Files with matching hashes are grouped together as duplicates.
+///
+/// This approach is efficient because it only performs expensive IO (hashing) on files
+/// that already share the same size, which is a strong filter.
 pub fn find_duplicates(root: &Path, min_size: u64) -> Result<DuplicateScanResult> {
     let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     let mut total_files_scanned: u64 = 0;
@@ -334,6 +346,7 @@ fn hash_file_sha256(path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Prints the results of a duplicate file scan to STDOUT.
 pub fn print_duplicate_report(result: &DuplicateScanResult) {
     println!("Duplicate File Report");
     println!("=====================");

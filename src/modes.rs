@@ -21,6 +21,7 @@ use crate::report::{format_size, print_report};
 use crate::scanner::{prepare_directory_plan, process_directory_child, scan_directory};
 use crate::tui::{App, AppAction, AppMessage, AppParams, draw_app};
 
+/// Main entry point for executing the requested scan mode.
 pub fn run() -> Result<()> {
     let mut args = Args::parse();
     let resolved_target =
@@ -38,6 +39,7 @@ pub fn run() -> Result<()> {
     let options = ScanOptions {
         mode,
         follow_symlinks: args.follow_symlinks,
+        show_files: args.file,
     };
 
     if args.duplicates {
@@ -49,6 +51,7 @@ pub fn run() -> Result<()> {
     }
 }
 
+/// Executes the duplicate file finder mode.
 fn run_duplicates_mode(args: &Args) -> Result<()> {
     eprintln!("Scanning for duplicates in {}...", args.target.display());
     let result = find_duplicates(&args.target, args.min_size)?;
@@ -56,6 +59,7 @@ fn run_duplicates_mode(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Executes the debug mode (legacy console output).
 fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel();
     let printer = std::thread::spawn(move || {
@@ -123,6 +127,7 @@ struct NavigationState {
     msg_rx: mpsc::Receiver<AppMessage>,
 }
 
+/// Executes the interactive TUI mode.
 fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -235,6 +240,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
     result
 }
 
+/// Initializes a new scan session for a target directory.
 fn start_scan_session(
     target: PathBuf,
     options: ScanOptions,
@@ -274,6 +280,7 @@ fn start_scan_session(
         mode: options.mode,
         cancel: cancel.clone(),
         errors: errors.clone(),
+        show_files: options.show_files,
     };
 
     let mut app = App::new(app_params);

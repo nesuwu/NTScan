@@ -23,6 +23,16 @@ use crate::model::{
     ScanErrorKind, ScanMode,
 };
 
+/// Scans a single directory, aggregating its total size and collecting children.
+///
+/// This function performs the following steps:
+/// 1. **Metadata Retrieval**: Fetches basic metadata (mtime, attributes) for the directory.
+/// 2. **Plan Preparation**: Enumerates entries and splits them into sub-directories and files.
+///    See [`prepare_directory_plan`] for details.
+/// 3. **Parallel Execution**: Processes sub-directories in parallel using `rayon`, recursively
+///    calling `scan_directory`.
+/// 4. **Aggregation**: Sums up the results from all children and local files to produce
+///    a final `DirectoryReport`.
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
@@ -96,6 +106,18 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
     Ok(report)
 }
 
+/// Reads a directory and segregates entries into sub-directories (for parallel scanning) and files/other (for immediate summation).
+///
+/// # Purpose
+///
+/// This function acts as the "map" phase of the scan. It iterates over the directory *once*,
+/// identifying which entries require a recursive scan (directories) and which can be
+/// processed immediately (files).
+///
+/// It also handles:
+/// * **Symlink Resolution**: deciding whether to follow links based on `ScanOptions`.
+/// * **File Summation**: Accumulating the size of files directly to avoid overhead.
+/// * **Error Handling**: Capturing permission errors during iteration.
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
     let mut directories = Vec::new();
     let mut precomputed_entries = Vec::new();
@@ -200,6 +222,44 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             {
                 *total += add;
             }
+
+            if context.options().show_files {
+                // Re-calculate ADS if necessary for the report?
+                // accumulate_file_sizes puts it in cache, so we can retrieve it if we want exact details in the entry.
+                // But `EntryReport` needs `ads_bytes` and `ads_count`.
+                // `accumulate_file_sizes` returns (logical, allocated), where logical INCLUDEs ADS bytes if in Accurate mode.
+                // But it doesn't return separate ADS stats.
+
+                // To get accurate ADS stats for the report entry, we might need to query the cache or re-check.
+                // Since we just called `accumulate_file_sizes`, the cache should be populated in Accurate mode.
+
+                let (ads_bytes, ads_count) = if context.options().mode == ScanMode::Accurate {
+                    context
+                        .cache()
+                        .get_attributes(&entry_path, meta.len(), meta.modified().ok())
+                        .map(|(_, bytes, count)| (bytes, count))
+                        .unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                };
+
+                // Note: `accumulate_file_sizes` returns `logical` which is `file_size + ads_size` in Accurate mode.
+                // In Fast mode, `logical` is just `file_size`.
+                // We should be consistent. `EntryReport.logical_size` usually matches what `accumulate_file_sizes` returns.
+
+                precomputed_entries.push(EntryReport {
+                    name,
+                    path: entry_path,
+                    kind: EntryKind::File,
+                    logical_size: logical,
+                    allocated_size: allocated,
+                    percent_of_parent: 0.0, // Calculated later
+                    ads_bytes,
+                    ads_count,
+                    error: None,
+                    modified: meta.modified().ok(),
+                });
+            }
             continue;
         }
 
@@ -220,6 +280,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     })
 }
 
+/// Recursively scans a subdirectory, handling symlink cycles if configured.
 pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryReport {
     if context.options().follow_symlinks
         && job.was_symlink

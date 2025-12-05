@@ -33,6 +33,7 @@ fn format_modified(timestamp: Option<SystemTime>) -> (Option<SystemTime>, String
     }
 }
 #[derive(Clone)]
+/// Represents a directory being tracked by the application.
 struct AppDirectory {
     name: String,
     path: PathBuf,
@@ -41,6 +42,7 @@ struct AppDirectory {
 }
 
 #[derive(Clone)]
+/// The scanning status of a directory.
 enum DirectoryStatus {
     Pending,
     Running,
@@ -48,18 +50,21 @@ enum DirectoryStatus {
 }
 
 #[derive(Clone)]
+/// Message passed from worker threads to the main TUI thread.
 pub enum AppMessage {
     DirectoryStarted(PathBuf),
     DirectoryFinished(EntryReport),
     AllDone,
 }
 
+/// Action triggered by user input in the TUI.
 pub enum AppAction {
     ChangeDirectory(PathBuf),
     GoBack,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Available sorting modes for the file list.
 enum SortMode {
     Name,
     Size,
@@ -85,6 +90,7 @@ impl SortMode {
 }
 
 #[derive(Clone)]
+/// Source of a row in the TUI list.
 enum RowOrigin {
     Directory(PathBuf),
     Other,
@@ -181,6 +187,11 @@ impl RowData {
     }
 }
 
+/// Configuration parameters for initializing the TUI application.
+///
+/// This struct implements the "Parameter Object" pattern to simplify the `App::new` signature.
+/// It aggregates all necessary state required to bootstrap the UI, including the initial
+/// target, scan results, and global context.
 pub struct AppParams {
     pub target: PathBuf,
     pub directories: Vec<ChildJob>,
@@ -190,8 +201,18 @@ pub struct AppParams {
     pub mode: ScanMode,
     pub cancel: CancelFlag,
     pub errors: ErrorStats,
+    pub show_files: bool,
 }
 
+/// The main TUI application state.
+///
+/// `App` is responsible for:
+/// * **State Management**: Tracking the current directory, navigation history, and selection.
+/// * **Event Handling**: Processing user input (keyboard) and async messages from the scanner.
+/// * **Rendering preparation**: Calculating visible rows and formatting data for the `ratatui` draw cycle.
+///
+/// It manages the lifecycle of a single scan session. Navigation to a new directory
+/// essentially replaces the `App` instance (managed by the runner loop).
 pub struct App {
     target: PathBuf,
     mode: ScanMode,
@@ -213,8 +234,10 @@ pub struct App {
     last_viewport: usize,
     rows_cache: Vec<RowData>,
     rows_dirty: bool,
+    show_files: bool,
 }
 impl App {
+    /// Creates a new TUI application instance.
     pub fn new(params: AppParams) -> Self {
         let AppParams {
             target,
@@ -225,6 +248,7 @@ impl App {
             mode,
             cancel,
             errors,
+            show_files,
         } = params;
         let total_dirs = directories.len();
         let directories = directories
@@ -258,6 +282,7 @@ impl App {
             last_viewport: 0,
             rows_cache: Vec::new(),
             rows_dirty: true,
+            show_files,
         }
     }
 
@@ -669,7 +694,7 @@ impl App {
             rows.push(RowData::from_entry(entry, total_logical, RowOrigin::Other));
         }
 
-        if self.file_logical > 0 {
+        if self.file_logical > 0 && !self.show_files {
             rows.push(RowData {
                 name: "[files]".to_string(),
                 name_key: "[files]".to_string(),

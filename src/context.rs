@@ -11,6 +11,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{ErrorStats, ProgressEvent, ScanErrorKind, ScanOptions};
 
+/// A thread-safe flag to signal cancellation across multiple worker threads.
+///
+/// This primitive wraps an `AtomicBool` inside an `Arc`, making it cheap to clone
+/// and share. It is primarily used to gracefully stop parallel directory traversals
+/// when the user requests an abort (e.g. pressing `q` or `Esc`).
+///
+/// # Example
+///
+/// ```rust
+/// use ntscan::context::CancelFlag;
+/// use std::thread;
+///
+/// let flag = CancelFlag::new();
+/// let worker_flag = flag.clone();
+///
+/// thread::spawn(move || {
+///     // Worker checks the flag periodically
+///     if worker_flag.is_cancelled() {
+///         return;
+///     }
+///     // Perform work...
+/// });
+///
+/// // Main thread signals cancellation
+/// flag.cancel();
+/// ```
 #[derive(Clone)]
 pub struct CancelFlag {
     inner: Arc<AtomicBool>,
@@ -23,16 +49,19 @@ impl Default for CancelFlag {
 }
 
 impl CancelFlag {
+    /// Creates a new cancellation flag.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// Signals cancellation to all observers.
     pub fn cancel(&self) {
         self.inner.store(true, AtomicOrdering::Release);
     }
 
+    /// Checks if cancellation has been requested.
     pub fn is_cancelled(&self) -> bool {
         self.inner.load(AtomicOrdering::Acquire)
     }
@@ -48,8 +77,22 @@ struct CachedAttributes {
     ads_count: u32,
 }
 
+/// Persisted cache for file attributes to speed up subsequent scans.
+///
+/// The cache stores `allocated_size` and `ads_stats` for files, keyed by their
+/// normalized (lower-cased) absolute path. This avoids expensive filesystem
+/// operations (like `GetCompressedFileSizeW` and stream enumeration) on unchanged files.
+///
+/// # Implementation Details
+///
+/// * **Sharding**: The cache is partitioned into 256 shards to reduce lock contention
+///   during parallel scanning.
+/// * **Persistence**: Data is saved to a binary file in `%LOCALAPPDATA%` (Windows)
+///   or the temporary directory (other OS).
+/// * **Validation**: Entries are only returned if the file's modification time and
+///   logical size match the cached values.
 pub struct ScanCache {
-    // Key is String (lowercased path) to handle Windows case-insensitivity
+    /// Key is String (lowercased path) to handle Windows case-insensitivity
     shards: Vec<Mutex<HashMap<String, CachedAttributes>>>,
     dirty: Arc<AtomicBool>,
     file_path: PathBuf,
@@ -74,6 +117,7 @@ impl Default for ScanCache {
 }
 
 impl ScanCache {
+    /// Creates a new cache backed by the specified file path.
     pub fn new(path: PathBuf) -> Self {
         let num_shards = 256; // Increased for concurrency
         let mut shards = Vec::with_capacity(num_shards);
@@ -91,6 +135,7 @@ impl ScanCache {
         cache
     }
 
+    /// Retrieves cached attributes if the file size and modification time match.
     pub fn get_attributes(
         &self,
         path: &Path,
@@ -116,6 +161,7 @@ impl ScanCache {
         None
     }
 
+    /// Updates or inserts attributes for a given path.
     pub fn insert_attributes(
         &self,
         path: PathBuf,
@@ -147,6 +193,7 @@ impl ScanCache {
         self.dirty.store(true, AtomicOrdering::Relaxed);
     }
 
+    /// Persists the cache to disk if it has been modified.
     pub fn save(&self) -> io::Result<()> {
         if !self.dirty.load(AtomicOrdering::Relaxed) {
             return Ok(());
@@ -293,6 +340,15 @@ struct VisitedState {
     paths: std::collections::HashSet<PathBuf>,
 }
 
+/// Shared context passed to scanning threads, containing options, cache, and synchronization primitives.
+///
+/// This struct acts as the "nervous system" for the scanner, aggregating:
+/// * **Configuration**: Read-only options (`ScanOptions`).
+/// * **State**: Mutable shared state (cache, visited paths, error stats).
+/// * **Control**: Synchronization primitives (cancellation flag, progress channel).
+///
+/// It is designed to be cheap to clone (`Arc`-wrapped internals) so it can be
+/// easily moved into closures for `rayon` parallel iterators.
 #[derive(Clone)]
 pub struct ScanContext {
     options: ScanOptions,
@@ -304,6 +360,7 @@ pub struct ScanContext {
 }
 
 impl ScanContext {
+    /// Creates a new ScanContext with default cache settings.
     pub fn new(
         options: ScanOptions,
         progress: Option<Sender<ProgressEvent>>,
@@ -319,6 +376,7 @@ impl ScanContext {
         )
     }
 
+    /// Creates a new ScanContext with a provided cache instance.
     pub fn with_cache(
         options: ScanOptions,
         progress: Option<Sender<ProgressEvent>>,
@@ -336,16 +394,27 @@ impl ScanContext {
         }
     }
 
+    /// Saves the internal cache to disk.
     pub fn save_cache(&self) {
         let _ = self.cache.save();
     }
 
+    /// Emits a progress event to the listener, if configured.
     pub fn emit(&self, event: ProgressEvent) {
         if let Some(tx) = &self.progress {
             let _ = tx.send(event);
         }
     }
 
+    /// Atomically checks if a path has been visited and marks it.
+    /// Returns `true` if the path is new (not previously visited).
+    ///
+    /// This method is critical for preventing infinite loops when following symbolic links.
+    /// It employs a dual-check strategy:
+    /// 1. **Path-based**: Checks the canonicalized path.
+    /// 2. **ID-based** (Windows only): Checks the unique `VolumeSerialNumber` and `FileIndex`
+    ///    to handle cases where different paths point to the same physical directory
+    ///    (e.g., subst drives, network shares).
     pub fn mark_if_new(&self, path: PathBuf) -> bool {
         let normalized = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         let identity = file_identity(&normalized).or_else(|| file_identity(&path));
@@ -359,22 +428,27 @@ impl ScanContext {
         by_path || by_id
     }
 
+    /// Returns the scan options.
     pub fn options(&self) -> ScanOptions {
         self.options
     }
 
+    /// Returns a reference to the cache.
     pub fn cache(&self) -> &ScanCache {
         self.cache.as_ref()
     }
 
+    /// Returns the cancellation flag.
     pub fn cancel_flag(&self) -> &CancelFlag {
         &self.cancel
     }
 
+    /// Returns the error statistics.
     pub fn errors(&self) -> &ErrorStats {
         &self.errors
     }
 
+    /// Records a scan error.
     pub fn record_error(&self, kind: ScanErrorKind) {
         self.errors.record(kind);
     }

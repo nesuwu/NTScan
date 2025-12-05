@@ -32,8 +32,12 @@ pub enum ScanMode {
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScanOptions {
+    /// The mode of scanning (Fast vs Accurate).
     pub mode: ScanMode,
+    /// Whether to follow symbolic links and junctions.
     pub follow_symlinks: bool,
+    /// Whether to include individual files in the report.
+    pub show_files: bool,
 }
 
 /// Categorisation for errors surfaced during scanning.
@@ -102,9 +106,15 @@ pub struct EntryReport {
 /// Classification for an entry appearing in the output.
 #[derive(Clone, Copy, Debug)]
 pub enum EntryKind {
+    /// A standard directory.
     Directory,
+    /// A directory symbolic link or junction.
     SymlinkDirectory,
+    /// A standard file.
+    File,
+    /// Any other file type (or unknown).
     Other,
+    /// An entry that was skipped (e.g. due to recursion).
     Skipped,
 }
 
@@ -114,6 +124,7 @@ impl EntryKind {
         match self {
             EntryKind::Directory => "DIR",
             EntryKind::SymlinkDirectory => "LNKD",
+            EntryKind::File => "FILE",
             EntryKind::Other => "OTHER",
             EntryKind::Skipped => "SKIP",
         }

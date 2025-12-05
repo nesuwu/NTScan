@@ -41,6 +41,9 @@ pub struct Args {
         help = "Minimum file size in bytes for duplicate detection"
     )]
     pub min_size: u64,
+
+    #[arg(long, help = "List all files in the directory")]
+    pub file: bool,
 }
 
 impl Args {
