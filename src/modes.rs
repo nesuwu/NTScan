@@ -123,7 +123,6 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
 // Used to store previous states for instant back navigation
 struct NavigationState {
     app: App,
-    context: Arc<ScanContext>,
     msg_rx: mpsc::Receiver<AppMessage>,
 }
 
@@ -138,8 +137,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
 
     let result = (|| -> Result<()> {
         let shared_cache = Arc::new(ScanCache::default());
-        let (mut app, mut context, mut msg_rx) =
-            start_scan_session(args.target.clone(), options, Arc::clone(&shared_cache))?;
+        let (mut app, mut context, mut msg_rx) = start_scan_session(
+            args.target.clone(),
+            options,
+            Arc::clone(&shared_cache),
+            args.delete_permanent,
+        )?;
 
         // History stack for Backspace
         let mut history: Vec<NavigationState> = Vec::new();
@@ -180,13 +183,16 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                         context.save_cache(); // Partial save on navigation
 
                         // Start new scan
-                        let (next_app, next_context, next_rx) =
-                            start_scan_session(target, options, Arc::clone(&shared_cache))?;
+                        let (next_app, next_context, next_rx) = start_scan_session(
+                            target,
+                            options,
+                            Arc::clone(&shared_cache),
+                            args.delete_permanent,
+                        )?;
 
                         // Push OLD state to history
                         let old_state = NavigationState {
                             app,
-                            context,
                             msg_rx,
                         };
                         history.push(old_state);
@@ -201,8 +207,17 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                         // 1. Try In-Memory History (Instant)
                         if let Some(state) = history.pop() {
                             app = state.app;
-                            context = state.context;
                             msg_rx = state.msg_rx;
+
+                            // Restore dummy context
+                            context = Arc::new(ScanContext::with_cache(
+                                options,
+                                None,
+                                CancelFlag::new(),
+                                ErrorStats::default(),
+                                Arc::clone(&shared_cache),
+                            ));
+                            
                             last_tick = Instant::now();
                         }
                         // 2. Fallback to Parent Directory (New Scan)
@@ -211,8 +226,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                             app.request_cancel();
                             context.save_cache();
 
-                            let (next_app, next_context, next_rx) =
-                                start_scan_session(target, options, Arc::clone(&shared_cache))?;
+                            let (next_app, next_context, next_rx) = start_scan_session(
+                                target,
+                                options,
+                                Arc::clone(&shared_cache),
+                                args.delete_permanent,
+                            )?;
 
                             app = next_app;
                             context = next_context;
@@ -245,6 +264,7 @@ fn start_scan_session(
     target: PathBuf,
     options: ScanOptions,
     cache: Arc<ScanCache>,
+    delete_permanent: bool,
 ) -> Result<(App, Arc<ScanContext>, mpsc::Receiver<AppMessage>)> {
     let cancel = CancelFlag::new();
     let errors = ErrorStats::default();
@@ -271,6 +291,8 @@ fn start_scan_session(
     } = prepare_directory_plan(&target, context.as_ref())
         .with_context(|| format!("failed to read {}", target.display()))?;
 
+    let (msg_tx, msg_rx) = mpsc::channel();
+
     let app_params = AppParams {
         target: target.clone(),
         directories: directories.clone(),
@@ -281,10 +303,11 @@ fn start_scan_session(
         cancel: cancel.clone(),
         errors: errors.clone(),
         show_files: options.show_files,
+        delete_permanent,
+        msg_tx: Some(msg_tx.clone()),
     };
 
     let mut app = App::new(app_params);
-    let (msg_tx, msg_rx) = mpsc::channel();
 
     if directories.is_empty() {
         app.handle_message(AppMessage::AllDone);

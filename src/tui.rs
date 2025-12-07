@@ -1,6 +1,8 @@
 use std::cmp::{Ordering, Reverse};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -55,6 +57,9 @@ pub enum AppMessage {
     DirectoryStarted(PathBuf),
     DirectoryFinished(EntryReport),
     AllDone,
+    DeleteStarted,
+    DeleteSuccess(PathBuf),
+    DeleteFailed(PathBuf, String),
 }
 
 /// Action triggered by user input in the TUI.
@@ -93,7 +98,7 @@ impl SortMode {
 /// Source of a row in the TUI list.
 enum RowOrigin {
     Directory(PathBuf),
-    Other,
+    File(PathBuf),
     Files,
     Parent,
 }
@@ -202,6 +207,8 @@ pub struct AppParams {
     pub cancel: CancelFlag,
     pub errors: ErrorStats,
     pub show_files: bool,
+    pub delete_permanent: bool,
+    pub msg_tx: Option<mpsc::Sender<AppMessage>>,
 }
 
 /// The main TUI application state.
@@ -235,6 +242,11 @@ pub struct App {
     rows_cache: Vec<RowData>,
     rows_dirty: bool,
     show_files: bool,
+    delete_permanent: bool,
+    confirm_delete: Option<PathBuf>,
+    msg_tx: Option<mpsc::Sender<AppMessage>>,
+    deleting: bool,
+    error_popup: Option<String>,
 }
 impl App {
     /// Creates a new TUI application instance.
@@ -249,6 +261,8 @@ impl App {
             cancel,
             errors,
             show_files,
+            delete_permanent,
+            msg_tx,
         } = params;
         let total_dirs = directories.len();
         let directories = directories
@@ -283,6 +297,11 @@ impl App {
             rows_cache: Vec::new(),
             rows_dirty: true,
             show_files,
+            delete_permanent,
+            confirm_delete: None,
+            msg_tx,
+            deleting: false,
+            error_popup: None,
         }
     }
 
@@ -291,6 +310,26 @@ impl App {
             AppMessage::DirectoryStarted(path) => self.mark_started(&path),
             AppMessage::DirectoryFinished(report) => self.apply_report(report),
             AppMessage::AllDone => self.mark_all_done(),
+            AppMessage::DeleteStarted => {
+                self.deleting = true;
+            }
+            AppMessage::DeleteSuccess(path) => {
+                self.deleting = false;
+                // Remove from lists
+                if let Some(idx) = self.directories.iter().position(|d| d.path == path) {
+                    self.directories.remove(idx);
+                } else if let Some(idx) = self.static_entries.iter().position(|e| e.path == path) {
+                    self.static_entries.remove(idx);
+                }
+                self.rows_dirty = true;
+                let total = self.total_rows();
+                self.ensure_selection_bounds(total);
+            }
+            AppMessage::DeleteFailed(path, error) => {
+                self.deleting = false;
+                self.errors.record(ScanErrorKind::Other);
+                self.error_popup = Some(format!("Failed to delete {}:\n{}", path.display(), error));
+            }
         }
         self.rows_dirty = true;
         let total = self.total_rows();
@@ -301,6 +340,33 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+
+        // If error popup is open, any key closes it
+        if self.error_popup.is_some() {
+            self.error_popup = None;
+            return None;
+        }
+
+        if self.deleting {
+            // Ignore input while deleting
+            return None;
+        }
+
+        if self.confirm_delete.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.execute_delete();
+                    self.confirm_delete = None;
+                    return None;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_delete = None;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -316,6 +382,10 @@ impl App {
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 self.cycle_sort();
+                None
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Delete => {
+                self.prepare_delete();
                 None
             }
             KeyCode::Down => {
@@ -345,6 +415,123 @@ impl App {
             KeyCode::Enter => self.activate_selection(),
             KeyCode::Backspace => Some(AppAction::GoBack),
             _ => None,
+        }
+    }
+
+    fn prepare_delete(&mut self) {
+        self.ensure_rows();
+        if self.rows_cache.is_empty() {
+            return;
+        }
+        let index = self.selected.min(self.rows_cache.len() - 1);
+        let path = match &self.rows_cache[index].origin {
+            RowOrigin::Directory(path) => Some(path.clone()),
+            RowOrigin::File(path) => Some(path.clone()),
+            _ => None,
+        };
+        self.confirm_delete = path;
+    }
+
+    fn execute_delete(&mut self) {
+        if let Some(path) = &self.confirm_delete {
+            if let Some(tx) = &self.msg_tx {
+                let tx = tx.clone();
+                let path = path.clone();
+                let permanent = self.delete_permanent;
+                
+                // Notify start
+                let _ = tx.send(AppMessage::DeleteStarted);
+
+                thread::spawn(move || {
+                    let result = Self::perform_deletion(&path, permanent);
+
+                    match result {
+                        Ok(_) => {
+                            let _ = tx.send(AppMessage::DeleteSuccess(path));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppMessage::DeleteFailed(path, e.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+    }
+    
+    fn perform_deletion(path: &Path, permanent: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::UI::Shell::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_ALLOWUNDO};
+            use std::os::windows::ffi::OsStrExt;
+
+            // SHFileOperation requires double-null terminated strings
+            let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+            wide_path.push(0);
+            wide_path.push(0);
+
+            let mut flags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+            if !permanent {
+                flags |= FOF_ALLOWUNDO;
+            }
+
+            let mut op = SHFILEOPSTRUCTW {
+                hwnd: windows::Win32::Foundation::HWND(0),
+                wFunc: FO_DELETE,
+                pFrom: windows::core::PCWSTR(wide_path.as_ptr()),
+                pTo: windows::core::PCWSTR::null(),
+                fFlags: flags.0 as u16,
+                fAnyOperationsAborted: false.into(),
+                hNameMappings: std::ptr::null_mut(),
+                lpszProgressTitle: windows::core::PCWSTR::null(),
+            };
+
+            let result = unsafe { SHFileOperationW(&mut op) };
+            
+            if result != 0 {
+                 return Err(Box::new(std::io::Error::from_raw_os_error(result)));
+            }
+            if bool::from(op.fAnyOperationsAborted) {
+                 return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation aborted")));
+            }
+            
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        {
+            if permanent {
+                // Try standard deletion first
+                let result = if path.is_dir() {
+                     fs::remove_dir_all(path)
+                } else {
+                     fs::remove_file(path)
+                };
+                
+                if result.is_ok() {
+                    return Ok(());
+                }
+
+                // If failed, try to strip Read-Only attribute and retry
+                if let Ok(metadata) = fs::metadata(path) {
+                    let mut permissions = metadata.permissions();
+                    if permissions.readonly() {
+                        permissions.set_readonly(false);
+                        let _ = fs::set_permissions(path, permissions);
+                         // Retry
+                        if path.is_dir() {
+                             fs::remove_dir_all(path)?;
+                        } else {
+                             fs::remove_file(path)?;
+                        }
+                        return Ok(());
+                    }
+                }
+
+                // If still failed, propagate original error
+                result.map_err(|e| e.into())
+            } else {
+                trash::delete(path).map_err(|e| e.into())
+            }
         }
     }
 
@@ -691,7 +878,11 @@ impl App {
             ) {
                 continue;
             }
-            rows.push(RowData::from_entry(entry, total_logical, RowOrigin::Other));
+            rows.push(RowData::from_entry(
+                entry,
+                total_logical,
+                RowOrigin::File(entry.path.clone()),
+            ));
         }
 
         if self.file_logical > 0 && !self.show_files {
@@ -794,6 +985,29 @@ impl App {
     }
 }
 
+use ratatui::layout::{Alignment, Rect};
+use ratatui::widgets::Clear;
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -829,7 +1043,7 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
             cncl, adsf, accd, shrv, othr
         )),
         Line::from(
-            "Keys: q/Esc quit | Enter open dir | Backspace go back | s change sort | Up/Down move | PgUp/PgDn, Home/End page",
+            "Keys: q/Esc quit | Enter open dir | Backspace go back | s change sort | Up/Down move | PgUp/PgDn, Home/End page | x/Del delete",
         ),
     ];
 
@@ -865,4 +1079,77 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
         .block(Block::default().title("Folders").borders(Borders::ALL))
         .column_spacing(1);
     frame.render_widget(table, chunks[1]);
+
+    // 1. Confirmation Popup
+    if let Some(path) = &app.confirm_delete {
+        let block = Block::default()
+            .title("Confirm Deletion")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Red));
+        let area = centered_rect(60, 25, frame.size());
+        frame.render_widget(Clear, area); // Clear background behind popup
+
+        let method = if app.delete_permanent {
+            "PERMANENTLY DELETE"
+        } else {
+            "Move to TRASH"
+        };
+
+        let text = vec![
+            Line::from(format!("ACTION: {}", method)).alignment(Alignment::Center).style(Style::default().add_modifier(Modifier::BOLD)),
+            Line::from("").alignment(Alignment::Center),
+            Line::from(format!("Target: {}", path.display())).alignment(Alignment::Center),
+            Line::from("").alignment(Alignment::Center),
+            Line::from("Press [Y] to CONFIRM").alignment(Alignment::Center).style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Line::from("Press [N] or [Esc] to CANCEL").alignment(Alignment::Center),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Center);
+        frame.render_widget(paragraph, area);
+    }
+
+    // 2. Deletion In-Progress Popup
+    if app.deleting {
+         let block = Block::default()
+            .title("Deleting...")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Yellow));
+        let area = centered_rect(40, 10, frame.size());
+        frame.render_widget(Clear, area); 
+        
+        let text = vec![
+            Line::from("Deleting selected item...").alignment(Alignment::Center),
+            Line::from("Please wait.").alignment(Alignment::Center),
+        ];
+         let paragraph = Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Center);
+        frame.render_widget(paragraph, area);
+    }
+
+    // 3. Error Popup
+    if let Some(err_msg) = &app.error_popup {
+        let block = Block::default()
+            .title("Deletion Error")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Red));
+        let area = centered_rect(60, 20, frame.size());
+        frame.render_widget(Clear, area);
+
+        let text = vec![
+            Line::from("An error occurred during deletion:").alignment(Alignment::Center),
+             Line::from("").alignment(Alignment::Center),
+            Line::from(err_msg.as_str()).alignment(Alignment::Center),
+             Line::from("").alignment(Alignment::Center),
+            Line::from("Press any key to close").alignment(Alignment::Center),
+        ];
+        
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        frame.render_widget(paragraph, area);
+    }
 }

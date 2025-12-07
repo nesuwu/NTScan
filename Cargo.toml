@@ -1,6 +1,6 @@
 [package]
 name = "ntscan"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
@@ -12,8 +12,12 @@ ratatui = "0.27"
 rayon = "1.10"
 time = { version = "0.3", features = ["formatting", "macros"] }
 sha2 = "0.10"
+trash = "3.3"
 windows = { version = "0.52.0", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
-    "Win32_System_IO"
+    "Win32_System_IO",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_Security"
 ] }

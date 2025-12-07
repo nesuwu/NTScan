@@ -220,7 +220,10 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             if let Some(total) = file_allocated.as_mut()
                 && let Some(add) = allocated
             {
-                *total += add;
+                // Only count allocated size if this is the first time seeing this file ID (hard link check)
+                if context.mark_file_unique_allocation(&entry_path) {
+                    *total += add;
+                }
             }
 
             if context.options().show_files {

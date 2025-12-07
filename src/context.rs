@@ -406,15 +406,36 @@ impl ScanContext {
         }
     }
 
+    /// Atomically checks if a file's unique identity (inode/FileID) has been seen before.
+    /// Returns `true` if this is the first time seeing this file content.
+    ///
+    /// This is used to prevent double-counting allocated size for hard links.
+    pub fn mark_file_unique_allocation(&self, path: &Path) -> bool {
+        // On Windows, strictly use FileIdentity (Volume + FileId) to detect hard links.
+        // On others, rely on canonical path (less robust for hard links but standard).
+        #[cfg(windows)]
+        {
+            if let Some(id) = file_identity(path) {
+                let mut state = self.visited.state.lock().unwrap();
+                return state.ids.insert(id);
+            }
+        }
+        
+        // Fallback if ID retrieval fails or on non-Windows
+        if let Ok(normalized) = fs::canonicalize(path) {
+             let mut state = self.visited.state.lock().unwrap();
+             return state.paths.insert(normalized);
+        }
+        
+        // Last resort: raw path (unlikely to be effective for dedup but safe default)
+        let mut state = self.visited.state.lock().unwrap();
+        state.paths.insert(path.to_path_buf())
+    }
+
     /// Atomically checks if a path has been visited and marks it.
     /// Returns `true` if the path is new (not previously visited).
     ///
     /// This method is critical for preventing infinite loops when following symbolic links.
-    /// It employs a dual-check strategy:
-    /// 1. **Path-based**: Checks the canonicalized path.
-    /// 2. **ID-based** (Windows only): Checks the unique `VolumeSerialNumber` and `FileIndex`
-    ///    to handle cases where different paths point to the same physical directory
-    ///    (e.g., subst drives, network shares).
     pub fn mark_if_new(&self, path: PathBuf) -> bool {
         let normalized = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         let identity = file_identity(&normalized).or_else(|| file_identity(&path));
@@ -468,39 +489,60 @@ struct FileIdentity;
 fn file_identity(path: &Path) -> Option<FileIdentity> {
     #[cfg(windows)]
     {
-        use std::ffi::c_void;
-        use std::fs::OpenOptions;
-        use std::os::windows::fs::OpenOptionsExt;
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            GetFileInformationByHandle, OPEN_EXISTING, BY_HANDLE_FILE_INFORMATION,
+        };
+        use windows::core::PCWSTR;
+
+        // 1. Canonicalize path to handle relative paths, dots, and ensure \\?\ prefix for long paths.
+        // This is critical because CreateFileW is strict about paths when using \\?\.
+        let safe_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mut wide_path: Vec<u16> = safe_path.as_os_str().encode_wide().collect();
+        wide_path.push(0);
+
+        // 2. Open with 0 access rights. This allows opening file for metadata query
+        // even if we lack Read/Write permissions (e.g., locked system files).
+        let handle_result = unsafe {
+            CreateFileW(
+                PCWSTR(wide_path.as_ptr()),
+                0, // 0 = No specific rights, just object query
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                HANDLE(0),
+            )
         };
 
-        let share_mode = FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0;
-        let file = OpenOptions::new()
-            .read(true)
-            .share_mode(share_mode)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
-            .open(path)
-            .ok()?;
+        if let Ok(handle) = handle_result {
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            let result = unsafe {
+                GetFileInformationByHandle(handle, &mut info)
+            };
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
 
-        let mut info = FILE_ID_INFO::default();
-        unsafe {
-            GetFileInformationByHandleEx(
-                HANDLE(file.as_raw_handle() as isize),
-                FileIdInfo,
-                &mut info as *mut _ as *mut c_void,
-                std::mem::size_of::<FILE_ID_INFO>() as u32,
-            )
-            .ok()?;
+            if result.is_ok() {
+                // Combine high and low parts of the index
+                let idx = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+                
+                // Map to our 128-bit ID storage (zero-padded)
+                let mut id = [0u8; 16];
+                id[0..8].copy_from_slice(&idx.to_le_bytes());
+                
+                return Some(FileIdentity {
+                    volume_serial: info.dwVolumeSerialNumber as u64,
+                    file_id: id,
+                });
+            }
         }
 
-        Some(FileIdentity {
-            volume_serial: info.VolumeSerialNumber,
-            file_id: info.FileId.Identifier,
-        })
+        None
     }
     #[cfg(not(windows))]
     {

@@ -44,6 +44,12 @@ pub struct Args {
 
     #[arg(long, help = "List all files in the directory")]
     pub file: bool,
+
+    #[arg(
+        long,
+        help = "Permanently delete files/folders (skipping trash) when using deletion features"
+    )]
+    pub delete_permanent: bool,
 }
 
 impl Args {

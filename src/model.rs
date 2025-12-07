@@ -27,7 +27,7 @@ pub enum ScanMode {
 /// ```rust
 /// use ntscan::model::{ScanMode, ScanOptions};
 ///
-/// let opts = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false };
+/// let opts = ScanOptions { mode: ScanMode::Fast, follow_symlinks: false, show_files: false };
 /// assert!(!opts.follow_symlinks);
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
