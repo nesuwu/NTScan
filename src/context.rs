@@ -420,13 +420,13 @@ impl ScanContext {
                 return state.ids.insert(id);
             }
         }
-        
+
         // Fallback if ID retrieval fails or on non-Windows
         if let Ok(normalized) = fs::canonicalize(path) {
-             let mut state = self.visited.state.lock().unwrap();
-             return state.paths.insert(normalized);
+            let mut state = self.visited.state.lock().unwrap();
+            return state.paths.insert(normalized);
         }
-        
+
         // Last resort: raw path (unlikely to be effective for dedup but safe default)
         let mut state = self.visited.state.lock().unwrap();
         state.paths.insert(path.to_path_buf())
@@ -492,9 +492,9 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            GetFileInformationByHandle, OPEN_EXISTING, BY_HANDLE_FILE_INFORMATION,
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            GetFileInformationByHandle, OPEN_EXISTING,
         };
         use windows::core::PCWSTR;
 
@@ -520,9 +520,7 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 
         if let Ok(handle) = handle_result {
             let mut info = BY_HANDLE_FILE_INFORMATION::default();
-            let result = unsafe {
-                GetFileInformationByHandle(handle, &mut info)
-            };
+            let result = unsafe { GetFileInformationByHandle(handle, &mut info) };
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
             }
@@ -530,11 +528,11 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
             if result.is_ok() {
                 // Combine high and low parts of the index
                 let idx = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
-                
+
                 // Map to our 128-bit ID storage (zero-padded)
                 let mut id = [0u8; 16];
                 id[0..8].copy_from_slice(&idx.to_le_bytes());
-                
+
                 return Some(FileIdentity {
                     volume_serial: info.dwVolumeSerialNumber as u64,
                     file_id: id,

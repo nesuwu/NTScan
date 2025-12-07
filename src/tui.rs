@@ -433,36 +433,42 @@ impl App {
     }
 
     fn execute_delete(&mut self) {
-        if let Some(path) = &self.confirm_delete {
-            if let Some(tx) = &self.msg_tx {
-                let tx = tx.clone();
-                let path = path.clone();
-                let permanent = self.delete_permanent;
-                
-                // Notify start
-                let _ = tx.send(AppMessage::DeleteStarted);
+        if let Some(path) = &self.confirm_delete
+            && let Some(tx) = &self.msg_tx
+        {
+            let tx = tx.clone();
+            let path = path.clone();
+            let permanent = self.delete_permanent;
 
-                thread::spawn(move || {
-                    let result = Self::perform_deletion(&path, permanent);
+            // Notify start
+            let _ = tx.send(AppMessage::DeleteStarted);
 
-                    match result {
-                        Ok(_) => {
-                            let _ = tx.send(AppMessage::DeleteSuccess(path));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(AppMessage::DeleteFailed(path, e.to_string()));
-                        }
+            thread::spawn(move || {
+                let result = Self::perform_deletion(&path, permanent);
+
+                match result {
+                    Ok(_) => {
+                        let _ = tx.send(AppMessage::DeleteSuccess(path));
                     }
-                });
-            }
+                    Err(e) => {
+                        let _ = tx.send(AppMessage::DeleteFailed(path, e.to_string()));
+                    }
+                }
+            });
         }
     }
-    
-    fn perform_deletion(path: &Path, permanent: bool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+
+    fn perform_deletion(
+        path: &Path,
+        permanent: bool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         #[cfg(windows)]
         {
-            use windows::Win32::UI::Shell::{SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_ALLOWUNDO};
             use std::os::windows::ffi::OsStrExt;
+            use windows::Win32::UI::Shell::{
+                FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+                SHFILEOPSTRUCTW, SHFileOperationW,
+            };
 
             // SHFileOperation requires double-null terminated strings
             let mut wide_path: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -486,15 +492,18 @@ impl App {
             };
 
             let result = unsafe { SHFileOperationW(&mut op) };
-            
+
             if result != 0 {
-                 return Err(Box::new(std::io::Error::from_raw_os_error(result)));
+                return Err(Box::new(std::io::Error::from_raw_os_error(result)));
             }
             if bool::from(op.fAnyOperationsAborted) {
-                 return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Interrupted, "Operation aborted")));
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "Operation aborted",
+                )));
             }
-            
-            return Ok(());
+
+            Ok(())
         }
 
         #[cfg(not(windows))]
@@ -502,11 +511,11 @@ impl App {
             if permanent {
                 // Try standard deletion first
                 let result = if path.is_dir() {
-                     fs::remove_dir_all(path)
+                    fs::remove_dir_all(path)
                 } else {
-                     fs::remove_file(path)
+                    fs::remove_file(path)
                 };
-                
+
                 if result.is_ok() {
                     return Ok(());
                 }
@@ -517,11 +526,11 @@ impl App {
                     if permissions.readonly() {
                         permissions.set_readonly(false);
                         let _ = fs::set_permissions(path, permissions);
-                         // Retry
+                        // Retry
                         if path.is_dir() {
-                             fs::remove_dir_all(path)?;
+                            fs::remove_dir_all(path)?;
                         } else {
-                             fs::remove_file(path)?;
+                            fs::remove_file(path)?;
                         }
                         return Ok(());
                     }
@@ -1096,11 +1105,15 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
         };
 
         let text = vec![
-            Line::from(format!("ACTION: {}", method)).alignment(Alignment::Center).style(Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(format!("ACTION: {}", method))
+                .alignment(Alignment::Center)
+                .style(Style::default().add_modifier(Modifier::BOLD)),
             Line::from("").alignment(Alignment::Center),
             Line::from(format!("Target: {}", path.display())).alignment(Alignment::Center),
             Line::from("").alignment(Alignment::Center),
-            Line::from("Press [Y] to CONFIRM").alignment(Alignment::Center).style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Line::from("Press [Y] to CONFIRM")
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Line::from("Press [N] or [Esc] to CANCEL").alignment(Alignment::Center),
         ];
 
@@ -1112,18 +1125,18 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
 
     // 2. Deletion In-Progress Popup
     if app.deleting {
-         let block = Block::default()
+        let block = Block::default()
             .title("Deleting...")
             .borders(Borders::ALL)
             .style(Style::default().fg(Color::Yellow));
         let area = centered_rect(40, 10, frame.size());
-        frame.render_widget(Clear, area); 
-        
+        frame.render_widget(Clear, area);
+
         let text = vec![
             Line::from("Deleting selected item...").alignment(Alignment::Center),
             Line::from("Please wait.").alignment(Alignment::Center),
         ];
-         let paragraph = Paragraph::new(text)
+        let paragraph = Paragraph::new(text)
             .block(block)
             .alignment(Alignment::Center);
         frame.render_widget(paragraph, area);
@@ -1140,12 +1153,12 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
 
         let text = vec![
             Line::from("An error occurred during deletion:").alignment(Alignment::Center),
-             Line::from("").alignment(Alignment::Center),
+            Line::from("").alignment(Alignment::Center),
             Line::from(err_msg.as_str()).alignment(Alignment::Center),
-             Line::from("").alignment(Alignment::Center),
+            Line::from("").alignment(Alignment::Center),
             Line::from("Press any key to close").alignment(Alignment::Center),
         ];
-        
+
         let paragraph = Paragraph::new(text)
             .block(block)
             .alignment(Alignment::Center)

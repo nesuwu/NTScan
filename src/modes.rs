@@ -191,10 +191,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                         )?;
 
                         // Push OLD state to history
-                        let old_state = NavigationState {
-                            app,
-                            msg_rx,
-                        };
+                        let old_state = NavigationState { app, msg_rx };
                         history.push(old_state);
 
                         // Switch to NEW state
@@ -217,7 +214,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                                 ErrorStats::default(),
                                 Arc::clone(&shared_cache),
                             ));
-                            
+
                             last_tick = Instant::now();
                         }
                         // 2. Fallback to Parent Directory (New Scan)
