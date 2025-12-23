@@ -11,9 +11,9 @@ use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_SHARING_VIOLATION, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_STANDARD_INFO, FileStandardInfo, FindClose, FindFirstStreamW, FindNextStreamW,
-    GetCompressedFileSizeW, GetFileInformationByHandleEx, STREAM_INFO_LEVELS,
-    WIN32_FIND_STREAM_DATA,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_STANDARD_INFO, FileStandardInfo, FindClose,
+    FindFirstStreamW, FindNextStreamW, GetCompressedFileSizeW, GetFileInformationByHandleEx,
+    STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
 };
 use windows::core::{HRESULT, PCWSTR};
 
@@ -162,7 +162,12 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             }
         };
 
-        let is_symlink = symlink_metadata.file_type().is_symlink();
+        // Detect reparse points (symlinks AND junctions) - not just symlinks!
+        // Rust's is_symlink() only returns true for symbolic links, NOT for junctions.
+        // Windows junctions like "Documents and Settings" -> "Users" would otherwise
+        // be followed as regular directories, causing massive double-counting.
+        let is_reparse_point = is_reparse_point(&symlink_metadata);
+        let is_symlink = symlink_metadata.file_type().is_symlink() || is_reparse_point;
 
         let target_metadata: Option<Metadata> = if is_symlink {
             if !context.options().follow_symlinks {
@@ -216,7 +221,15 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 
         if meta.is_file() {
             let (logical, allocated) = accumulate_file_sizes(&entry_path, &meta, context);
-            file_logical += logical;
+
+            // Check if this file content is unique (hard-link detection for logical size)
+            // This prevents double-counting when the same file appears at multiple paths
+            // (common in Windows WinSxS, Installer, and other system directories)
+            let is_first_logical_instance = context.mark_file_unique_logical(&entry_path);
+            if is_first_logical_instance {
+                file_logical += logical;
+            }
+
             if let Some(total) = file_allocated.as_mut()
                 && let Some(add) = allocated
             {
@@ -580,4 +593,15 @@ fn classify_anyhow_error(err: &anyhow::Error) -> ScanErrorKind {
     } else {
         ScanErrorKind::Other
     }
+}
+
+/// Checks if a file/directory is a reparse point (junction, mount point, or symlink).
+///
+/// Rust's `is_symlink()` only detects symbolic links, not NTFS junctions.
+/// Windows system directories like `C:\Documents and Settings` are junctions
+/// pointing to `C:\Users`, and would cause massive double-counting if followed.
+fn is_reparse_point(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let attrs = metadata.file_attributes();
+    (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
 }

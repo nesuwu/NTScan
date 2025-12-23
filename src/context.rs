@@ -332,6 +332,8 @@ struct Visited {
 struct VisitedState {
     paths: std::collections::HashSet<PathBuf>,
     ids: std::collections::HashSet<FileIdentity>,
+    /// Tracks file identities for logical size deduplication (hard-link detection)
+    logical_ids: std::collections::HashSet<FileIdentity>,
 }
 
 #[cfg(not(windows))]
@@ -472,6 +474,30 @@ impl ScanContext {
     /// Records a scan error.
     pub fn record_error(&self, kind: ScanErrorKind) {
         self.errors.record(kind);
+    }
+
+    /// Atomically checks if a file's unique identity has been seen before for logical size.
+    /// Returns `true` if this is the first time seeing this file content.
+    ///
+    /// This is used to prevent double-counting logical size for hard-linked files.
+    /// Windows system directories (WinSxS, Installer, etc.) contain many hard links,
+    /// which would otherwise inflate the reported size far beyond actual disk usage.
+    pub fn mark_file_unique_logical(&self, path: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            if let Some(id) = file_identity(path) {
+                let mut state = self.visited.state.lock().unwrap();
+                return state.logical_ids.insert(id);
+            }
+        }
+
+        // Fallback for non-Windows or if ID retrieval fails: always count
+        // This is safe (may over-count) but avoids under-counting on failure
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+        }
+        true
     }
 }
 
