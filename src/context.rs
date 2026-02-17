@@ -99,20 +99,30 @@ pub struct ScanCache {
 }
 
 const CACHE_MAGIC: &[u8; 8] = b"NTSC0003"; // Version 3 (Case Insensitive)
+const CACHE_ENV_PATH: &str = "NTSCAN_CACHE_PATH";
+const MAX_CACHE_ENTRIES: u64 = 2_000_000;
+const MAX_CACHE_PATH_BYTES: usize = 16 * 1024;
 
 impl Default for ScanCache {
     fn default() -> Self {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let mut path = PathBuf::from(local_app_data);
-            path.push("ntscan");
-            if fs::create_dir_all(&path).is_ok() {
-                path.push("cache");
+        if let Some(path) = std::env::var_os(CACHE_ENV_PATH) {
+            let path = PathBuf::from(path);
+            if !path.as_os_str().is_empty() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 return Self::new(path);
             }
         }
-        let mut path = std::env::temp_dir();
-        path.push("ntscan.cache");
-        Self::new(path)
+
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let mut dir = PathBuf::from(local_app_data);
+            dir.push("ntscan");
+            if fs::create_dir_all(&dir).is_ok() {
+                return Self::new(dir.join("cache"));
+            }
+        }
+        Self::new(std::env::temp_dir().join("ntscan.cache"))
     }
 }
 
@@ -259,6 +269,9 @@ impl ScanCache {
             return Ok(());
         }
         let count = u64::from_le_bytes(buf_u64);
+        if count > MAX_CACHE_ENTRIES {
+            return Ok(());
+        }
 
         let mut buf_u16 = [0u8; 2];
 
@@ -267,6 +280,9 @@ impl ScanCache {
                 break;
             }
             let path_len = u16::from_le_bytes(buf_u16) as usize;
+            if path_len == 0 || path_len > MAX_CACHE_PATH_BYTES {
+                break;
+            }
 
             let mut path_buf = vec![0u8; path_len];
             if reader.read_exact(&mut path_buf).is_err() {

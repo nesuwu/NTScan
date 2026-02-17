@@ -57,10 +57,7 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
         .map(|job| process_directory_child(job, context))
         .collect();
 
-    precomputed_entries.append(&mut dir_entries);
-    let mut entries = precomputed_entries;
-
-    let directories_logical: u64 = entries.iter().map(|entry| entry.logical_size).sum();
+    let directories_logical: u64 = dir_entries.iter().map(|entry| entry.logical_size).sum();
     let total_logical = file_logical + directories_logical;
 
     let mut total_allocated = match (context.options().mode, file_allocated) {
@@ -69,12 +66,15 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
     };
 
     if let Some(total) = total_allocated.as_mut() {
-        for entry in &entries {
+        for entry in &dir_entries {
             if let Some(alloc) = entry.allocated_size {
                 *total += alloc;
             }
         }
     }
+
+    precomputed_entries.append(&mut dir_entries);
+    let mut entries = precomputed_entries;
 
     for entry in &mut entries {
         entry.percent_of_parent = if total_logical == 0 {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -8,10 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 use crate::model::{DuplicateGroup, DuplicateScanResult};
 
 const HASH_CACHE_MAGIC: &[u8; 8] = b"NTSH0001";
+const HASH_CACHE_ENV_PATH: &str = "NTSCAN_HASH_CACHE_PATH";
+const MAX_HASH_CACHE_ENTRIES: u64 = 2_000_000;
+const MAX_HASH_CACHE_PATH_BYTES: usize = 16 * 1024;
 
 struct HashCache {
     entries: Mutex<HashMap<String, CachedHash>>,
@@ -28,18 +33,8 @@ struct CachedHash {
 }
 
 impl HashCache {
-    fn new() -> Self {
-        let file_path = if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let mut path = PathBuf::from(local_app_data);
-            path.push("ntscan");
-            let _ = fs::create_dir_all(&path);
-            path.push("hash_cache");
-            path
-        } else {
-            let mut path = std::env::temp_dir();
-            path.push("ntscan_hash.cache");
-            path
-        };
+    fn new(path_override: Option<PathBuf>) -> Self {
+        let file_path = path_override.unwrap_or_else(resolve_hash_cache_path);
 
         let mut cache = Self {
             entries: Mutex::new(HashMap::new()),
@@ -95,6 +90,9 @@ impl HashCache {
             return Ok(());
         }
         let count = u64::from_le_bytes(buf8);
+        if count > MAX_HASH_CACHE_ENTRIES {
+            return Ok(());
+        }
 
         let mut buf2 = [0u8; 2];
         let mut guard = self.entries.lock().unwrap();
@@ -104,6 +102,9 @@ impl HashCache {
                 break;
             }
             let path_len = u16::from_le_bytes(buf2) as usize;
+            if path_len == 0 || path_len > MAX_HASH_CACHE_PATH_BYTES {
+                break;
+            }
 
             let mut path_buf = vec![0u8; path_len];
             if reader.read_exact(&mut path_buf).is_err() {
@@ -230,11 +231,26 @@ impl Progress {
 /// This approach is efficient because it only performs expensive IO (hashing) on files
 /// that already share the same size, which is a strong filter.
 pub fn find_duplicates(root: &Path, min_size: u64) -> Result<DuplicateScanResult> {
+    find_duplicates_with_cache(root, min_size, None)
+}
+
+pub fn find_duplicates_with_cache(
+    root: &Path,
+    min_size: u64,
+    hash_cache_path: Option<PathBuf>,
+) -> Result<DuplicateScanResult> {
     let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     let mut total_files_scanned: u64 = 0;
+    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
 
     eprint!("Collecting files...\r");
-    collect_files(root, min_size, &mut files_by_size, &mut total_files_scanned)?;
+    collect_files(
+        root,
+        min_size,
+        &mut files_by_size,
+        &mut total_files_scanned,
+        &mut visited_dirs,
+    )?;
     eprintln!(
         "Collected {} files                    ",
         total_files_scanned
@@ -248,7 +264,7 @@ pub fn find_duplicates(root: &Path, min_size: u64) -> Result<DuplicateScanResult
     let total_to_hash: u64 = candidates.iter().map(|(_, p)| p.len() as u64).sum();
     eprintln!("Found {} potential duplicates to hash", total_to_hash);
 
-    let cache = HashCache::new();
+    let cache = HashCache::new(hash_cache_path);
     let progress = Progress::new(total_to_hash);
     let mut groups: Vec<DuplicateGroup> = Vec::new();
 
@@ -302,7 +318,13 @@ fn collect_files(
     min_size: u64,
     map: &mut HashMap<u64, Vec<PathBuf>>,
     count: &mut u64,
+    visited_dirs: &mut HashSet<PathBuf>,
 ) -> Result<()> {
+    let normalized = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !visited_dirs.insert(normalized) {
+        return Ok(());
+    }
+
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Ok(()),
@@ -310,13 +332,17 @@ fn collect_files(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        let meta = match entry.metadata() {
+        let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(_) => continue,
         };
 
+        if is_reparse_point(&meta) {
+            continue;
+        }
+
         if meta.is_dir() {
-            let _ = collect_files(&path, min_size, map, count);
+            let _ = collect_files(&path, min_size, map, count, visited_dirs);
         } else if meta.is_file() {
             let size = meta.len();
             if size >= min_size {
@@ -344,6 +370,39 @@ fn hash_file_sha256(path: &Path) -> Result<[u8; 32]> {
     }
 
     Ok(hasher.finalize().into())
+}
+
+fn resolve_hash_cache_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(HASH_CACHE_ENV_PATH) {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            return path;
+        }
+    }
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let mut dir = PathBuf::from(local_app_data);
+        dir.push("ntscan");
+        let _ = fs::create_dir_all(&dir);
+        return dir.join("hash_cache");
+    }
+
+    std::env::temp_dir().join("ntscan_hash.cache")
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 /// Prints the results of a duplicate file scan to STDOUT.

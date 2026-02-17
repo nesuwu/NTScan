@@ -13,17 +13,22 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use rayon::{ThreadPoolBuilder, prelude::*};
 
-use crate::args::Args;
+use crate::args::{Args, CLI_DEFAULT_MIN_SIZE};
 use crate::context::{CancelFlag, ScanCache, ScanContext};
-use crate::duplicates::{find_duplicates, print_duplicate_report};
+use crate::duplicates::print_duplicate_report;
+use crate::engine;
 use crate::model::{DirectoryPlan, ErrorStats, ProgressEvent, ScanMode, ScanOptions};
 use crate::report::{format_size, print_report};
-use crate::scanner::{prepare_directory_plan, process_directory_child, scan_directory};
+use crate::scanner::{prepare_directory_plan, process_directory_child};
+use crate::settings::{AppSettings, load_settings};
 use crate::tui::{App, AppAction, AppMessage, AppParams, draw_app};
 
 /// Main entry point for executing the requested scan mode.
 pub fn run() -> Result<()> {
     let mut args = Args::parse();
+    let settings = load_settings();
+    apply_cli_defaults(&mut args, &settings);
+
     let resolved_target =
         resolve_initial_target(&args.target).context("failed to resolve target directory")?;
     args.target = resolved_target;
@@ -43,24 +48,28 @@ pub fn run() -> Result<()> {
     };
 
     if args.duplicates {
-        run_duplicates_mode(&args)
+        run_duplicates_mode(&args, &settings)
     } else if args.debug {
-        run_debug_mode(&args, options)
+        run_debug_mode(&args, options, &settings)
     } else {
-        run_tui_mode(&args, options)
+        run_tui_mode(&args, options, settings)
     }
 }
 
 /// Executes the duplicate file finder mode.
-fn run_duplicates_mode(args: &Args) -> Result<()> {
+fn run_duplicates_mode(args: &Args, settings: &AppSettings) -> Result<()> {
     eprintln!("Scanning for duplicates in {}...", args.target.display());
-    let result = find_duplicates(&args.target, args.min_size)?;
+    let result = engine::run_duplicates(
+        &args.target,
+        args.min_size,
+        settings.hash_cache_path.clone(),
+    )?;
     print_duplicate_report(&result);
     Ok(())
 }
 
 /// Executes the debug mode (legacy console output).
-fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
+fn run_debug_mode(args: &Args, options: ScanOptions, settings: &AppSettings) -> Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel();
     let printer = std::thread::spawn(move || {
         while let Ok(event) = progress_rx.recv() {
@@ -97,23 +106,12 @@ fn run_debug_mode(args: &Args, options: ScanOptions) -> Result<()> {
         }
     });
 
-    let context = Arc::new(ScanContext::new(
+    let report = engine::run_scan(
+        &args.target,
         options,
+        settings.scan_cache_path.clone(),
         Some(progress_tx.clone()),
-        CancelFlag::new(),
-        ErrorStats::default(),
-    ));
-
-    if options.follow_symlinks
-        && let Ok(canon) = std::fs::canonicalize(&args.target)
-    {
-        context.mark_if_new(canon);
-    }
-
-    let report = scan_directory(&args.target, &context)
-        .with_context(|| format!("failed to scan {}", args.target.display()))?;
-
-    context.save_cache();
+    )?;
     drop(progress_tx);
     let _ = printer.join();
     print_report(&report);
@@ -127,7 +125,7 @@ struct NavigationState {
 }
 
 /// Executes the interactive TUI mode.
-fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
+fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings) -> Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -136,12 +134,16 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
     terminal.clear().context("failed to clear terminal")?;
 
     let result = (|| -> Result<()> {
-        let shared_cache = Arc::new(ScanCache::default());
+        let mut settings = initial_settings;
+        let mut options = options;
+        let mut delete_permanent = args.delete_permanent;
+        let mut shared_cache = Arc::new(scan_cache_from_settings(&settings));
         let (mut app, mut context, mut msg_rx) = start_scan_session(
             args.target.clone(),
             options,
             Arc::clone(&shared_cache),
-            args.delete_permanent,
+            delete_permanent,
+            settings.clone(),
         )?;
 
         // History stack for Backspace
@@ -187,7 +189,8 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                             target,
                             options,
                             Arc::clone(&shared_cache),
-                            args.delete_permanent,
+                            delete_permanent,
+                            settings.clone(),
                         )?;
 
                         // Push OLD state to history
@@ -227,7 +230,8 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                                 target,
                                 options,
                                 Arc::clone(&shared_cache),
-                                args.delete_permanent,
+                                delete_permanent,
+                                settings.clone(),
                             )?;
 
                             app = next_app;
@@ -235,6 +239,35 @@ fn run_tui_mode(args: &Args, options: ScanOptions) -> Result<()> {
                             msg_rx = next_rx;
                             last_tick = Instant::now();
                         }
+                    }
+                    AppAction::ApplySettings(new_settings) => {
+                        app.request_cancel();
+                        context.save_cache();
+
+                        settings = new_settings;
+                        options = ScanOptions {
+                            mode: settings.default_mode,
+                            follow_symlinks: settings.default_follow_symlinks,
+                            show_files: settings.default_show_files,
+                        };
+                        delete_permanent = settings.default_delete_permanent;
+
+                        shared_cache = Arc::new(scan_cache_from_settings(&settings));
+                        history.clear();
+
+                        let target = app.target().to_path_buf();
+                        let (next_app, next_context, next_rx) = start_scan_session(
+                            target,
+                            options,
+                            Arc::clone(&shared_cache),
+                            delete_permanent,
+                            settings.clone(),
+                        )?;
+
+                        app = next_app;
+                        context = next_context;
+                        msg_rx = next_rx;
+                        last_tick = Instant::now();
                     }
                 }
             }
@@ -262,6 +295,7 @@ fn start_scan_session(
     options: ScanOptions,
     cache: Arc<ScanCache>,
     delete_permanent: bool,
+    settings: AppSettings,
 ) -> Result<(App, Arc<ScanContext>, mpsc::Receiver<AppMessage>)> {
     let cancel = CancelFlag::new();
     let errors = ErrorStats::default();
@@ -302,6 +336,7 @@ fn start_scan_session(
         show_files: options.show_files,
         delete_permanent,
         msg_tx: Some(msg_tx.clone()),
+        settings,
     };
 
     let mut app = App::new(app_params);
@@ -329,6 +364,32 @@ fn start_scan_session(
     drop(msg_tx);
 
     Ok((app, context, msg_rx))
+}
+
+fn apply_cli_defaults(args: &mut Args, settings: &AppSettings) {
+    if !args.fast && !args.accurate && settings.default_mode == ScanMode::Accurate {
+        args.accurate = true;
+    }
+    if !args.follow_symlinks {
+        args.follow_symlinks = settings.default_follow_symlinks;
+    }
+    if !args.file {
+        args.file = settings.default_show_files;
+    }
+    if !args.delete_permanent {
+        args.delete_permanent = settings.default_delete_permanent;
+    }
+    if args.min_size == CLI_DEFAULT_MIN_SIZE {
+        args.min_size = settings.min_duplicate_size;
+    }
+}
+
+fn scan_cache_from_settings(settings: &AppSettings) -> ScanCache {
+    if let Some(path) = &settings.scan_cache_path {
+        ScanCache::new(path.clone())
+    } else {
+        ScanCache::default()
+    }
 }
 
 fn resolve_initial_target(path: &Path) -> Result<PathBuf> {

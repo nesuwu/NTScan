@@ -3,16 +3,26 @@ name = "ntscan"
 version = "0.4.1"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["tui"]
+tui = ["dep:crossterm", "dep:ratatui", "dep:trash"]
+ffi = ["dep:serde", "dep:serde_json"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.27"
+crossterm = { version = "0.27", optional = true }
 num_cpus = "1.16"
-ratatui = "0.27"
+ratatui = { version = "0.27", optional = true }
 rayon = "1.10"
 time = { version = "0.3", features = ["formatting", "macros"] }
 sha2 = "0.10"
-trash = "3.3"
+trash = { version = "3.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 windows = { version = "0.52.0", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -21,3 +31,6 @@ windows = { version = "0.52.0", features = [
     "Win32_System_Com",
     "Win32_Security"
 ] }
+
+[dev-dependencies]
+tempfile = "3"

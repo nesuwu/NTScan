@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use crate::model::ScanMode;
 
+pub const CLI_DEFAULT_MIN_SIZE: u64 = 1_048_576;
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -37,7 +39,7 @@ pub struct Args {
 
     #[arg(
         long,
-        default_value = "1048576",
+        default_value_t = CLI_DEFAULT_MIN_SIZE,
         help = "Minimum file size in bytes for duplicate detection"
     )]
     pub min_size: u64,

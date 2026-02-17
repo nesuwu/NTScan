@@ -1,9 +1,15 @@
 pub mod args;
 pub mod context;
 pub mod duplicates;
+pub mod engine;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 pub mod model;
+#[cfg(feature = "tui")]
 pub mod modes;
 pub mod report;
 pub mod scanner;
+pub mod settings;
+#[cfg(feature = "tui")]
 pub mod tui;
 pub mod util;
