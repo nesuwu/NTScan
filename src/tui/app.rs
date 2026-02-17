@@ -257,9 +257,7 @@ impl App {
         let mut error_message: Option<String> = None;
 
         {
-            let Some(popup) = self.settings_popup.as_mut() else {
-                return None;
-            };
+            let popup = self.settings_popup.as_mut()?;
 
             if popup.editing {
                 match key.code {

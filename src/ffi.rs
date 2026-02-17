@@ -143,7 +143,10 @@ pub extern "C" fn ntscan_find_duplicates_json(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ntscan_free_string(ptr: *mut c_char) {
+/// # Safety
+/// `ptr` must be a pointer previously returned by one of this library's
+/// `*_json` exports and not already freed.
+pub unsafe extern "C" fn ntscan_free_string(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }

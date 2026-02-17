@@ -34,7 +34,7 @@ impl ThemePreset {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         if value.eq_ignore_ascii_case("default") {
             Some(ThemePreset::Default)
         } else if value.eq_ignore_ascii_case("ocean") {
@@ -185,7 +185,7 @@ fn parse_settings(content: &str) -> AppSettings {
                 settings.hash_cache_path = parse_optional_path(value);
             }
             "theme" => {
-                if let Some(theme) = ThemePreset::from_str(value) {
+                if let Some(theme) = ThemePreset::parse(value) {
                     settings.theme = theme;
                 }
             }

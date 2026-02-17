@@ -18,9 +18,7 @@ pub fn run_scan(
     cache_path: Option<PathBuf>,
     progress: Option<Sender<ProgressEvent>>,
 ) -> Result<DirectoryReport> {
-    let cache = cache_path
-        .map(ScanCache::new)
-        .unwrap_or_else(ScanCache::default);
+    let cache = cache_path.map(ScanCache::new).unwrap_or_default();
 
     let context = Arc::new(ScanContext::with_cache(
         options,
