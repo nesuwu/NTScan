@@ -275,19 +275,28 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             // This prevents double-counting when the same file appears at multiple paths
             // (common in Windows WinSxS, Installer, and other system directories)
             let is_first_logical_instance = context.mark_file_unique_logical(&entry_path);
-            if is_first_logical_instance {
-                file_logical += logical;
-            }
+            let accounted_logical = if is_first_logical_instance {
+                logical
+            } else {
+                0
+            };
+            file_logical += accounted_logical;
 
-            if let Some(total) = file_allocated.as_mut()
-                && let Some(add) = allocated
-            {
+            let mut accounted_allocated = allocated;
+            let mut is_first_alloc_instance = true;
+            if let Some(add) = allocated {
                 // Only count allocated size if this is the first time seeing this file ID (hard link check)
-                if context.mark_file_unique_allocation(&entry_path) {
-                    *total += add;
+                is_first_alloc_instance = context.mark_file_unique_allocation(&entry_path);
+                if is_first_alloc_instance {
+                    if let Some(total) = file_allocated.as_mut() {
+                        *total += add;
+                    }
+                } else {
+                    accounted_allocated = Some(0);
                 }
             }
 
+            let is_hardlink_duplicate = !is_first_logical_instance || !is_first_alloc_instance;
             if context.options().show_files {
                 // Re-calculate ADS if necessary for the report?
                 // accumulate_file_sizes puts it in cache, so we can retrieve it if we want exact details in the entry.
@@ -312,12 +321,20 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
                 // In Fast mode, `logical` is just `file_size`.
                 // We should be consistent. `EntryReport.logical_size` usually matches what `accumulate_file_sizes` returns.
 
+                // Option A UX: still show duplicate hardlink entries, but make their accounted
+                // contribution explicit by zeroing size fields and appending a label.
+                let display_name = if is_hardlink_duplicate {
+                    format!("{name} (hardlink duplicate)")
+                } else {
+                    name
+                };
+
                 precomputed_entries.push(EntryReport {
-                    name,
+                    name: display_name,
                     path: entry_path,
                     kind: EntryKind::File,
-                    logical_size: logical,
-                    allocated_size: allocated,
+                    logical_size: accounted_logical,
+                    allocated_size: accounted_allocated,
                     percent_of_parent: 0.0, // Calculated later
                     ads_bytes,
                     ads_count,
