@@ -218,11 +218,12 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 
         let target_metadata: Option<Metadata> = if is_symlink {
             if !context.options().follow_symlinks {
+                context.record_skipped();
                 context.emit(ProgressEvent::Skipped(
                     entry_path.clone(),
                     String::from("symlink not followed (use --follow-symlinks)"),
                 ));
-                precomputed_entries.push(entry_with_error(
+                precomputed_entries.push(entry_with_skip(
                     name,
                     entry_path.clone(),
                     EntryKind::Skipped,
@@ -338,6 +339,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
                     ads_bytes,
                     ads_count,
                     error: None,
+                    skip_reason: None,
                     modified: meta.modified().ok(),
                 });
             }
@@ -370,11 +372,12 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
         && let Ok(canon) = fs::canonicalize(&job.path)
         && !context.mark_if_new(canon)
     {
+        context.record_skipped();
         context.emit(ProgressEvent::Skipped(
             job.path.clone(),
             String::from("cycle detected"),
         ));
-        return Ok(entry_with_error(
+        return Ok(entry_with_skip(
             job.name,
             job.path,
             EntryKind::SymlinkDirectory,
@@ -398,6 +401,7 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
             ads_bytes: 0,
             ads_count: 0,
             error: None,
+            skip_reason: None,
             modified: report.mtime,
         }),
         Err(err) if is_scan_cancelled(&err) => Err(err),
@@ -521,6 +525,28 @@ fn entry_with_error(
         ads_bytes: 0,
         ads_count: 0,
         error: Some(message.into()),
+        skip_reason: None,
+        modified: None,
+    }
+}
+
+fn entry_with_skip(
+    name: String,
+    path: PathBuf,
+    kind: EntryKind,
+    reason: impl Into<String>,
+) -> EntryReport {
+    EntryReport {
+        name,
+        path,
+        kind,
+        logical_size: 0,
+        allocated_size: None,
+        percent_of_parent: 0.0,
+        ads_bytes: 0,
+        ads_count: 0,
+        error: None,
+        skip_reason: Some(reason.into()),
         modified: None,
     }
 }

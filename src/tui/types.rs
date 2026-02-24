@@ -242,12 +242,16 @@ impl RowData {
     ) -> Self {
         let name = entry.name.clone();
         let name_key = name.to_lowercase();
-        let status = if entry.error.is_some() {
+        let status = if entry.is_skipped() {
+            "SKIP".to_string()
+        } else if entry.error.is_some() {
             "ERR".to_string()
         } else {
             "DONE".to_string()
         };
-        let style = if entry.error.is_some() {
+        let style = if entry.is_skipped() {
+            Style::default().fg(palette.pending)
+        } else if entry.error.is_some() {
             Style::default().fg(palette.error)
         } else {
             Style::default().fg(palette.ok)
@@ -309,4 +313,3 @@ impl RowData {
         .style(style)
     }
 }
-

@@ -39,6 +39,7 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
     let accd = *errs.get(&ScanErrorKind::AccessDenied).unwrap_or(&0);
     let shrv = *errs.get(&ScanErrorKind::SharingViolation).unwrap_or(&0);
     let othr = *errs.get(&ScanErrorKind::Other).unwrap_or(&0);
+    let skipped = app.skipped_count();
 
     let total_logical = app.total_logical();
     let allocated_text = app
@@ -58,8 +59,8 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
             app.elapsed()
         )),
         Line::from(format!(
-            "Errors - Cancelled:{}  ADS:{}  Access:{}  Share:{}  Other:{}",
-            cncl, adsf, accd, shrv, othr
+            "Errors - Cancelled:{}  ADS:{}  Access:{}  Share:{}  Other:{} | Skipped:{}",
+            cncl, adsf, accd, shrv, othr, skipped
         )),
         Line::from(
             "Keys: q/Esc quit | Enter open dir | Backspace go back | s sort | g settings | Up/Down move | PgUp/PgDn, Home/End page | x/Del delete",

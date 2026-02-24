@@ -37,6 +37,7 @@ struct FfiEntryReport {
     ads_bytes: u64,
     ads_count: usize,
     error: Option<String>,
+    skip_reason: Option<String>,
     modified_unix_secs: Option<i64>,
 }
 
@@ -93,6 +94,7 @@ pub extern "C" fn ntscan_scan_directory_json(
                     ads_bytes: entry.ads_bytes,
                     ads_count: entry.ads_count,
                     error: entry.error,
+                    skip_reason: entry.skip_reason,
                     modified_unix_secs: unix_seconds(entry.modified),
                 })
                 .collect(),

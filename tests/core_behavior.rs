@@ -42,6 +42,10 @@ fn total_recorded_errors(context: &ScanContext) -> usize {
     context.errors().snapshot().values().copied().sum()
 }
 
+fn total_recorded_skips(context: &ScanContext) -> usize {
+    context.skipped_count()
+}
+
 #[cfg(windows)]
 fn create_windows_dir_link(link: &Path, target: &Path) -> Result<()> {
     use std::process::Command;
@@ -266,16 +270,25 @@ fn no_follow_symlinks_skips_windows_directory_links() -> Result<()> {
     assert!(matches!(entry.kind, EntryKind::Skipped));
     assert!(
         entry
-            .error
+            .skip_reason
             .as_deref()
             .unwrap_or_default()
             .contains("symlink not followed"),
         "expected no-follow reason for skipped directory link",
     );
+    assert!(
+        entry.error.is_none(),
+        "policy skip entries should not be marked as errors",
+    );
     assert_eq!(
         total_recorded_errors(&context),
         0,
         "policy skips must not increment global error counters",
+    );
+    assert_eq!(
+        total_recorded_skips(&context),
+        1,
+        "policy skips should increment skipped counters",
     );
 
     Ok(())
@@ -310,16 +323,25 @@ fn follow_symlinks_detects_windows_directory_link_cycles() -> Result<()> {
     assert_eq!(cycle_entry.logical_size, 0);
     assert!(
         cycle_entry
-            .error
+            .skip_reason
             .as_deref()
             .unwrap_or_default()
             .contains("already visited target"),
         "expected cycle-detection skip for followed directory link",
     );
+    assert!(
+        cycle_entry.error.is_none(),
+        "cycle skips should not be marked as errors",
+    );
     assert_eq!(
         total_recorded_errors(&context),
         0,
         "cycle-protection skips must not increment global error counters",
+    );
+    assert_eq!(
+        total_recorded_skips(&context),
+        1,
+        "cycle-protection skips should increment skipped counters",
     );
 
     Ok(())
@@ -349,16 +371,25 @@ fn no_follow_symlinks_skips_directory_symlinks_on_unix() -> Result<()> {
     assert!(matches!(entry.kind, EntryKind::Skipped));
     assert!(
         entry
-            .error
+            .skip_reason
             .as_deref()
             .unwrap_or_default()
             .contains("symlink not followed"),
         "expected no-follow reason for skipped directory symlink",
     );
+    assert!(
+        entry.error.is_none(),
+        "policy skip entries should not be marked as errors",
+    );
     assert_eq!(
         total_recorded_errors(&context),
         0,
         "policy skips must not increment global error counters",
+    );
+    assert_eq!(
+        total_recorded_skips(&context),
+        1,
+        "policy skips should increment skipped counters",
     );
 
     Ok(())

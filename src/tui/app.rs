@@ -718,6 +718,23 @@ impl App {
         &self.errors
     }
 
+    pub fn skipped_count(&self) -> usize {
+        let mut total = self
+            .static_entries
+            .iter()
+            .filter(|entry| entry.is_skipped())
+            .count();
+        total += self
+            .directories
+            .iter()
+            .filter_map(|directory| match &directory.status {
+                DirectoryStatus::Finished(report) if report.is_skipped() => Some(1usize),
+                _ => None,
+            })
+            .sum::<usize>();
+        total
+    }
+
     pub fn target(&self) -> &Path {
         &self.target
     }
@@ -1008,4 +1025,3 @@ impl App {
         rows
     }
 }
-

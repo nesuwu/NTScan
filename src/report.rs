@@ -25,6 +25,12 @@ pub use crate::util::fmt_bytes as format_size;
 /// print_report(&report);
 /// ```
 pub fn print_report(report: &DirectoryReport) {
+    let skipped_count = report
+        .entries
+        .iter()
+        .filter(|entry| entry.is_skipped())
+        .count();
+
     println!("Target: {}", report.path.display());
     println!("Logical total: {}", fmt_bytes(report.logical_size));
     if let Some(allocated) = report.allocated_size {
@@ -33,6 +39,9 @@ pub fn print_report(report: &DirectoryReport) {
         println!("Allocated total: n/a (fast mode or partial data)");
     }
     println!("Items: {}", report.entries.len());
+    if skipped_count > 0 {
+        println!("Skipped: {}", skipped_count);
+    }
     println!("-");
     println!(
         "{:<45} {:>7} {:>14} {:>14} {:>9} {:>8}",
@@ -66,6 +75,9 @@ pub fn print_report(report: &DirectoryReport) {
         );
         if let Some(error) = &entry.error {
             println!("    ! {}", error);
+        }
+        if let Some(reason) = &entry.skip_reason {
+            println!("    - skipped: {}", reason);
         }
     }
 }

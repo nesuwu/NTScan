@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -77,6 +78,24 @@ impl ErrorStats {
     }
 }
 
+/// Thread-safe accumulator for skipped-entry statistics.
+#[derive(Default, Clone)]
+pub struct SkipStats {
+    count: Arc<AtomicUsize>,
+}
+
+impl SkipStats {
+    /// Increments the skipped counter.
+    pub fn record(&self) {
+        self.count.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Returns the current skipped counter.
+    pub fn count(&self) -> usize {
+        self.count.load(AtomicOrdering::Relaxed)
+    }
+}
+
 /// Aggregated information for a scanned directory.
 #[derive(Clone)]
 pub struct DirectoryReport {
@@ -99,8 +118,15 @@ pub struct EntryReport {
     pub ads_bytes: u64,
     pub ads_count: usize,
     pub error: Option<String>,
+    pub skip_reason: Option<String>,
     #[allow(dead_code)]
     pub modified: Option<SystemTime>,
+}
+
+impl EntryReport {
+    pub fn is_skipped(&self) -> bool {
+        matches!(self.kind, EntryKind::Skipped) || self.skip_reason.is_some()
+    }
 }
 
 /// Classification for an entry appearing in the output.

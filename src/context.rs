@@ -9,7 +9,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{ErrorStats, ProgressEvent, ScanErrorKind, ScanOptions};
+use crate::model::{ErrorStats, ProgressEvent, ScanErrorKind, ScanOptions, SkipStats};
 
 /// A thread-safe flag to signal cancellation across multiple worker threads.
 ///
@@ -423,6 +423,7 @@ pub struct ScanContext {
     cancel: CancelFlag,
     cancel_noted: Arc<AtomicBool>,
     errors: ErrorStats,
+    skipped: SkipStats,
 }
 
 impl ScanContext {
@@ -458,6 +459,7 @@ impl ScanContext {
             cancel,
             cancel_noted: Arc::new(AtomicBool::new(false)),
             errors,
+            skipped: SkipStats::default(),
         }
     }
 
@@ -541,6 +543,16 @@ impl ScanContext {
     /// Returns the error statistics.
     pub fn errors(&self) -> &ErrorStats {
         &self.errors
+    }
+
+    /// Records a skipped entry.
+    pub fn record_skipped(&self) {
+        self.skipped.record();
+    }
+
+    /// Returns the total number of skipped entries.
+    pub fn skipped_count(&self) -> usize {
+        self.skipped.count()
     }
 
     /// Records a scan error.
