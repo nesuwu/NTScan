@@ -64,13 +64,20 @@ pub fn is_scan_cancelled(err: &anyhow::Error) -> bool {
 /// 4. **Aggregation**: Sums up the results from all children and local files to produce
 ///    a final `DirectoryReport`.
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
+    let result = scan_directory_inner(path, context);
+    if let Err(err) = &result
+        && !is_scan_cancelled(err)
+    {
+        context.record_error(classify_anyhow_error(err));
+    }
+    result
+}
+
+fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     check_cancelled(context)?;
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
     let metadata = fs::metadata(path)
-        .inspect_err(|err| {
-            context.record_error(classify_io_error(err));
-        })
         .with_context(|| format!("metadata access failed for {}", path.display()))?;
     let mtime = metadata.modified().ok();
 
@@ -171,9 +178,6 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     };
 
     let read_dir = fs::read_dir(path)
-        .inspect_err(|err| {
-            context.record_error(classify_io_error(err));
-        })
         .with_context(|| format!("failed to read directory {}", path.display()))?;
 
     for (index, entry) in read_dir.enumerate() {
@@ -181,11 +185,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             check_cancelled(context)?;
         }
 
-        let entry = entry
-            .inspect_err(|err| {
-                context.record_error(classify_io_error(err));
-            })
-            .with_context(|| format!("failed to iterate {}", path.display()))?;
+        let entry = entry.with_context(|| format!("failed to iterate {}", path.display()))?;
         let name = entry.file_name().to_string_lossy().to_string();
         let entry_path = entry.path();
 
@@ -222,7 +222,6 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
                     entry_path.clone(),
                     String::from("symlink not followed (use --follow-symlinks)"),
                 ));
-                context.record_error(ScanErrorKind::Other);
                 precomputed_entries.push(entry_with_error(
                     name,
                     entry_path.clone(),
@@ -375,7 +374,6 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
             job.path.clone(),
             String::from("cycle detected"),
         ));
-        context.record_error(ScanErrorKind::Other);
         return Ok(entry_with_error(
             job.name,
             job.path,

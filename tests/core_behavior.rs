@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use ntscan::context::{CancelFlag, ScanCache, ScanContext};
 use ntscan::duplicates::find_duplicates;
-use ntscan::model::{ChildJob, EntryKind, ErrorStats, ScanMode, ScanOptions};
+use ntscan::model::{ChildJob, EntryKind, ErrorStats, ScanErrorKind, ScanMode, ScanOptions};
 use ntscan::scanner::{process_directory_child, scan_directory};
 use tempfile::TempDir;
 
@@ -36,6 +36,10 @@ fn build_context_with_follow(
 
 fn build_fast_context(cache_home: &TempDir, show_files: bool) -> ScanContext {
     build_context(cache_home, ScanMode::Fast, show_files)
+}
+
+fn total_recorded_errors(context: &ScanContext) -> usize {
+    context.errors().snapshot().values().copied().sum()
 }
 
 #[cfg(windows)]
@@ -142,6 +146,51 @@ fn process_directory_child_preserves_symlink_kind_when_scan_fails() -> Result<()
     assert!(matches!(report.kind, EntryKind::SymlinkDirectory));
     assert_eq!(report.path, path);
     assert!(report.error.is_some());
+    assert_eq!(
+        total_recorded_errors(&context),
+        1,
+        "directory scan failures should increment global counters once",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn process_directory_child_read_dir_failure_increments_error_counters() -> Result<()> {
+    let root = TempDir::new()?;
+    let context = build_fast_context(&root, true);
+    let not_a_directory = root.path().join("not-a-directory.bin");
+    fs::write(&not_a_directory, b"content")?;
+
+    let report = process_directory_child(
+        ChildJob {
+            name: "not-a-directory.bin".to_string(),
+            path: not_a_directory.clone(),
+            was_symlink: false,
+        },
+        &context,
+    )?;
+
+    assert!(matches!(report.kind, EntryKind::Directory));
+    assert_eq!(report.path, not_a_directory);
+    assert!(
+        report
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("directory scan failed"),
+        "expected a surfaced directory-scan error entry",
+    );
+    assert_eq!(
+        context
+            .errors()
+            .snapshot()
+            .get(&ScanErrorKind::Other)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "read_dir-style directory failures should increment Other exactly once",
+    );
 
     Ok(())
 }
@@ -223,6 +272,11 @@ fn no_follow_symlinks_skips_windows_directory_links() -> Result<()> {
             .contains("symlink not followed"),
         "expected no-follow reason for skipped directory link",
     );
+    assert_eq!(
+        total_recorded_errors(&context),
+        0,
+        "policy skips must not increment global error counters",
+    );
 
     Ok(())
 }
@@ -262,6 +316,11 @@ fn follow_symlinks_detects_windows_directory_link_cycles() -> Result<()> {
             .contains("already visited target"),
         "expected cycle-detection skip for followed directory link",
     );
+    assert_eq!(
+        total_recorded_errors(&context),
+        0,
+        "cycle-protection skips must not increment global error counters",
+    );
 
     Ok(())
 }
@@ -295,6 +354,11 @@ fn no_follow_symlinks_skips_directory_symlinks_on_unix() -> Result<()> {
             .unwrap_or_default()
             .contains("symlink not followed"),
         "expected no-follow reason for skipped directory symlink",
+    );
+    assert_eq!(
+        total_recorded_errors(&context),
+        0,
+        "policy skips must not increment global error counters",
     );
 
     Ok(())
