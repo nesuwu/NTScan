@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
@@ -20,8 +20,10 @@ const MAX_HASH_CACHE_PATH_BYTES: usize = 16 * 1024;
 
 struct HashCache {
     entries: Mutex<HashMap<String, CachedHash>>,
-    dirty: std::sync::atomic::AtomicBool,
+    dirty: AtomicBool,
     file_path: PathBuf,
+    finalizer: Arc<dyn HashCacheFinalizer>,
+    save_error_logged: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -32,15 +34,39 @@ struct CachedHash {
     hash: [u8; 32],
 }
 
+trait HashCacheFinalizer: Send + Sync {
+    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()>;
+}
+
+struct StdHashCacheFinalizer;
+
+impl HashCacheFinalizer for StdHashCacheFinalizer {
+    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()> {
+        fs::rename(temp_path, final_path)
+    }
+}
+
 impl HashCache {
     fn new(path_override: Option<PathBuf>) -> Self {
         let file_path = path_override.unwrap_or_else(resolve_hash_cache_path);
+        let mut cache = Self::with_finalizer(file_path, Arc::new(StdHashCacheFinalizer));
+        let _ = cache.load();
+        cache
+    }
 
-        let mut cache = Self {
+    fn with_finalizer(file_path: PathBuf, finalizer: Arc<dyn HashCacheFinalizer>) -> Self {
+        Self {
             entries: Mutex::new(HashMap::new()),
-            dirty: std::sync::atomic::AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
             file_path,
-        };
+            finalizer,
+            save_error_logged: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_finalizer(file_path: PathBuf, finalizer: Arc<dyn HashCacheFinalizer>) -> Self {
+        let mut cache = Self::with_finalizer(file_path, finalizer);
         let _ = cache.load();
         cache
     }
@@ -158,7 +184,28 @@ impl HashCache {
         writer.flush()?;
         drop(writer);
         drop(guard);
-        let _ = fs::rename(temp_path, &self.file_path);
+
+        if let Err(err) = self.finalizer.finalize(&temp_path, &self.file_path) {
+            let contextual_err = io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to finalize hash cache save ({} -> {}): {}",
+                    temp_path.display(),
+                    self.file_path.display(),
+                    err
+                ),
+            );
+            if !self.save_error_logged.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "warning: {}. temp hash cache file left at {}",
+                    contextual_err,
+                    temp_path.display()
+                );
+            }
+            return Err(contextual_err.into());
+        }
+
+        self.save_error_logged.store(false, Ordering::Relaxed);
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -300,7 +347,7 @@ pub fn find_duplicates_with_cache(
     }
 
     eprintln!();
-    let _ = cache.save();
+    cache.save().context("failed to save hash cache")?;
 
     groups.sort_by_key(|b| std::cmp::Reverse(b.reclaimable_bytes()));
 
@@ -435,5 +482,55 @@ pub fn print_duplicate_report(result: &DuplicateScanResult) {
             println!("    {}", path.display());
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    struct FailingHashCacheFinalizer;
+
+    impl HashCacheFinalizer for FailingHashCacheFinalizer {
+        fn finalize(&self, _temp_path: &Path, _final_path: &Path) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated rename failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn save_returns_error_and_keeps_dirty_when_finalize_fails() {
+        let dir = tempdir().expect("failed to create temp directory");
+        let cache_path = dir.path().join("hash.cache");
+        let cache =
+            HashCache::new_with_finalizer(cache_path.clone(), Arc::new(FailingHashCacheFinalizer));
+        let temp_path = cache_path.with_extension("tmp");
+
+        cache.insert(
+            &dir.path().join("item.bin"),
+            64,
+            Some(SystemTime::now()),
+            [7u8; 32],
+        );
+
+        let err = cache
+            .save()
+            .expect_err("save should fail when finalization fails");
+        assert!(
+            err.to_string()
+                .contains("failed to finalize hash cache save"),
+            "error should surface hash cache finalization failure"
+        );
+        assert!(
+            cache.dirty.load(Ordering::Relaxed),
+            "dirty should remain true after failed save finalization"
+        );
+        assert!(
+            temp_path.exists(),
+            "temp cache file should be preserved after failed finalization"
+        );
     }
 }

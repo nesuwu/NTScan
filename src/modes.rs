@@ -241,7 +241,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                     AppAction::ChangeDirectory(target) => {
                         // Save state before leaving
                         app.request_cancel();
-                        context.save_cache(); // Partial save on navigation
+                        let _ = context.save_cache(); // Partial save on navigation
 
                         // Start new scan
                         let (next_app, next_context, next_rx) = start_scan_session(
@@ -283,7 +283,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                         else if let Some(parent) = app.target().parent() {
                             let target = parent.to_path_buf();
                             app.request_cancel();
-                            context.save_cache();
+                            let _ = context.save_cache();
 
                             let (next_app, next_context, next_rx) = start_scan_session(
                                 target,
@@ -301,7 +301,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                     }
                     AppAction::ApplySettings(new_settings) => {
                         app.request_cancel();
-                        context.save_cache();
+                        let _ = context.save_cache();
 
                         settings = new_settings;
                         options = ScanOptions {
@@ -336,7 +336,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
             }
         }
 
-        context.save_cache();
+        let _ = context.save_cache();
         Ok(())
     })();
 

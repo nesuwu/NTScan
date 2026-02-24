@@ -96,12 +96,26 @@ pub struct ScanCache {
     shards: Vec<Mutex<HashMap<String, CachedAttributes>>>,
     dirty: Arc<AtomicBool>,
     file_path: PathBuf,
+    finalizer: Arc<dyn ScanCacheFinalizer>,
+    save_error_logged: AtomicBool,
 }
 
 const CACHE_MAGIC: &[u8; 8] = b"NTSC0003"; // Version 3 (Case Insensitive)
 const CACHE_ENV_PATH: &str = "NTSCAN_CACHE_PATH";
 const MAX_CACHE_ENTRIES: u64 = 2_000_000;
 const MAX_CACHE_PATH_BYTES: usize = 16 * 1024;
+
+trait ScanCacheFinalizer: Send + Sync {
+    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()>;
+}
+
+struct StdScanCacheFinalizer;
+
+impl ScanCacheFinalizer for StdScanCacheFinalizer {
+    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()> {
+        fs::rename(temp_path, final_path)
+    }
+}
 
 impl Default for ScanCache {
     fn default() -> Self {
@@ -129,18 +143,30 @@ impl Default for ScanCache {
 impl ScanCache {
     /// Creates a new cache backed by the specified file path.
     pub fn new(path: PathBuf) -> Self {
+        let cache = Self::with_finalizer(path, Arc::new(StdScanCacheFinalizer));
+        let _ = cache.load();
+        cache
+    }
+
+    fn with_finalizer(path: PathBuf, finalizer: Arc<dyn ScanCacheFinalizer>) -> Self {
         let num_shards = 256; // Increased for concurrency
         let mut shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
             shards.push(Mutex::new(HashMap::new()));
         }
 
-        let cache = Self {
+        Self {
             shards,
             dirty: Arc::new(AtomicBool::new(false)),
             file_path: path,
-        };
+            finalizer,
+            save_error_logged: AtomicBool::new(false),
+        }
+    }
 
+    #[cfg(test)]
+    fn new_with_finalizer(path: PathBuf, finalizer: Arc<dyn ScanCacheFinalizer>) -> Self {
+        let cache = Self::with_finalizer(path, finalizer);
         let _ = cache.load();
         cache
     }
@@ -246,7 +272,28 @@ impl ScanCache {
 
         writer.flush()?;
         drop(writer);
-        let _ = fs::rename(temp_path, &self.file_path);
+
+        if let Err(err) = self.finalizer.finalize(&temp_path, &self.file_path) {
+            let contextual_err = io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to finalize scan cache save ({} -> {}): {}",
+                    temp_path.display(),
+                    self.file_path.display(),
+                    err
+                ),
+            );
+            if !self.save_error_logged.swap(true, AtomicOrdering::Relaxed) {
+                eprintln!(
+                    "warning: {}. temp cache file left at {}",
+                    contextual_err,
+                    temp_path.display()
+                );
+            }
+            return Err(contextual_err);
+        }
+
+        self.save_error_logged.store(false, AtomicOrdering::Relaxed);
         self.dirty.store(false, AtomicOrdering::Relaxed);
         Ok(())
     }
@@ -415,8 +462,8 @@ impl ScanContext {
     }
 
     /// Saves the internal cache to disk.
-    pub fn save_cache(&self) {
-        let _ = self.cache.save();
+    pub fn save_cache(&self) -> io::Result<()> {
+        self.cache.save()
     }
 
     /// Emits a progress event to the listener, if configured.
@@ -597,5 +644,55 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
     {
         let _ = path;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    struct FailingScanCacheFinalizer;
+
+    impl ScanCacheFinalizer for FailingScanCacheFinalizer {
+        fn finalize(&self, _temp_path: &Path, _final_path: &Path) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated rename failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn save_returns_error_and_keeps_dirty_when_finalize_fails() {
+        let dir = tempdir().expect("failed to create temp directory");
+        let cache_path = dir.path().join("scan.cache");
+        let cache =
+            ScanCache::new_with_finalizer(cache_path.clone(), Arc::new(FailingScanCacheFinalizer));
+        let temp_path = cache_path.with_extension("tmp");
+
+        cache.insert_attributes(
+            dir.path().join("item.txt"),
+            Some(SystemTime::now()),
+            123,
+            456,
+            0,
+            0,
+        );
+
+        let err = cache
+            .save()
+            .expect_err("save should fail when finalization fails");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            cache.dirty.load(AtomicOrdering::Relaxed),
+            "dirty should remain true after failed save finalization"
+        );
+        assert!(
+            temp_path.exists(),
+            "temp cache file should be preserved after failed finalization"
+        );
     }
 }

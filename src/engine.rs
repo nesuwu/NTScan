@@ -47,7 +47,7 @@ pub fn run_scan_with_cancel(
 
     let report = scan_directory(target, &context)
         .with_context(|| format!("failed to scan {}", target.display()))?;
-    context.save_cache();
+    context.save_cache().context("failed to save scan cache")?;
     Ok(report)
 }
 
