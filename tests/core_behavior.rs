@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use ntscan::context::{CancelFlag, ScanCache, ScanContext};
 use ntscan::duplicates::find_duplicates;
-use ntscan::model::{EntryKind, ErrorStats, ScanMode, ScanOptions};
-use ntscan::scanner::scan_directory;
+use ntscan::model::{ChildJob, EntryKind, ErrorStats, ScanMode, ScanOptions};
+use ntscan::scanner::{process_directory_child, scan_directory};
 use tempfile::TempDir;
 
 fn build_fast_context(cache_home: &TempDir, show_files: bool) -> ScanContext {
@@ -72,6 +72,28 @@ fn scan_directory_without_show_files_only_lists_directories() -> Result<()> {
     assert_eq!(report.entries[0].name, "child");
     assert!(matches!(report.entries[0].kind, EntryKind::Directory));
     assert_eq!(report.entries[0].logical_size, 11);
+
+    Ok(())
+}
+
+#[test]
+fn process_directory_child_preserves_symlink_kind_when_scan_fails() -> Result<()> {
+    let root = TempDir::new()?;
+    let context = build_fast_context(&root, true);
+    let path = root.path().join("missing-symlink-target");
+
+    let report = process_directory_child(
+        ChildJob {
+            name: "missing-symlink-target".to_string(),
+            path: path.clone(),
+            was_symlink: true,
+        },
+        &context,
+    )?;
+
+    assert!(matches!(report.kind, EntryKind::SymlinkDirectory));
+    assert_eq!(report.path, path);
+    assert!(report.error.is_some());
 
     Ok(())
 }

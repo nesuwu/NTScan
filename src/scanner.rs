@@ -394,7 +394,11 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
             Ok(entry_with_error(
                 job.name,
                 job.path,
-                EntryKind::Directory,
+                if job.was_symlink {
+                    EntryKind::SymlinkDirectory
+                } else {
+                    EntryKind::Directory
+                },
                 format!("directory scan failed: {}", err),
             ))
         }
