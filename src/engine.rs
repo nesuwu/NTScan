@@ -18,12 +18,23 @@ pub fn run_scan(
     cache_path: Option<PathBuf>,
     progress: Option<Sender<ProgressEvent>>,
 ) -> Result<DirectoryReport> {
+    run_scan_with_cancel(target, options, cache_path, progress, CancelFlag::new())
+}
+
+/// Runs a full directory scan using a caller-provided cancellation flag.
+pub fn run_scan_with_cancel(
+    target: &Path,
+    options: ScanOptions,
+    cache_path: Option<PathBuf>,
+    progress: Option<Sender<ProgressEvent>>,
+    cancel: CancelFlag,
+) -> Result<DirectoryReport> {
     let cache = cache_path.map(ScanCache::new).unwrap_or_default();
 
     let context = Arc::new(ScanContext::with_cache(
         options,
         progress,
-        CancelFlag::new(),
+        cancel,
         ErrorStats::default(),
         Arc::new(cache),
     ));

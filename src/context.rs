@@ -374,6 +374,7 @@ pub struct ScanContext {
     visited: Arc<Visited>,
     progress: Option<Sender<ProgressEvent>>,
     cancel: CancelFlag,
+    cancel_noted: Arc<AtomicBool>,
     errors: ErrorStats,
 }
 
@@ -408,6 +409,7 @@ impl ScanContext {
             visited: Arc::new(Visited::default()),
             progress,
             cancel,
+            cancel_noted: Arc::new(AtomicBool::new(false)),
             errors,
         }
     }
@@ -480,6 +482,13 @@ impl ScanContext {
     /// Returns the cancellation flag.
     pub fn cancel_flag(&self) -> &CancelFlag {
         &self.cancel
+    }
+
+    /// Records cancellation once per scan session.
+    pub fn note_cancelled(&self) {
+        if !self.cancel_noted.swap(true, AtomicOrdering::Relaxed) {
+            self.errors.record(ScanErrorKind::Cancelled);
+        }
     }
 
     /// Returns the error statistics.

@@ -1,6 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -12,6 +14,10 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use rayon::{ThreadPoolBuilder, prelude::*};
+#[cfg(windows)]
+use windows::Win32::Foundation::{BOOL, FALSE, TRUE};
+#[cfg(windows)]
+use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 
 use crate::args::{Args, CLI_DEFAULT_MIN_SIZE};
 use crate::context::{CancelFlag, ScanCache, ScanContext};
@@ -19,9 +25,48 @@ use crate::duplicates::print_duplicate_report;
 use crate::engine;
 use crate::model::{DirectoryPlan, ErrorStats, ProgressEvent, ScanMode, ScanOptions};
 use crate::report::{format_size, print_report};
-use crate::scanner::{prepare_directory_plan, process_directory_child};
+use crate::scanner::{is_scan_cancelled, prepare_directory_plan, process_directory_child};
 use crate::settings::{AppSettings, load_settings};
 use crate::tui::{App, AppAction, AppMessage, AppParams, draw_app};
+
+#[cfg(windows)]
+static DEBUG_CANCEL_SLOT: OnceLock<Mutex<Option<CancelFlag>>> = OnceLock::new();
+
+#[cfg(windows)]
+fn debug_cancel_slot() -> &'static Mutex<Option<CancelFlag>> {
+    DEBUG_CANCEL_SLOT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn debug_ctrl_handler(ctrl: u32) -> BOOL {
+    match ctrl {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => {
+            if let Ok(guard) = debug_cancel_slot().lock()
+                && let Some(cancel) = guard.as_ref()
+            {
+                cancel.cancel();
+            }
+            TRUE
+        }
+        _ => FALSE,
+    }
+}
+
+#[cfg(windows)]
+fn install_debug_cancel_handler(cancel: CancelFlag) -> Result<()> {
+    *debug_cancel_slot().lock().unwrap() = Some(cancel);
+    unsafe {
+        SetConsoleCtrlHandler(Some(debug_ctrl_handler), true)
+            .ok()
+            .context("failed to install Ctrl+C handler")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn install_debug_cancel_handler(_cancel: CancelFlag) -> Result<()> {
+    Ok(())
+}
 
 /// Main entry point for executing the requested scan mode.
 pub fn run() -> Result<()> {
@@ -71,6 +116,7 @@ fn run_duplicates_mode(args: &Args, settings: &AppSettings) -> Result<()> {
 /// Executes the debug mode (legacy console output).
 fn run_debug_mode(args: &Args, options: ScanOptions, settings: &AppSettings) -> Result<()> {
     let (progress_tx, progress_rx) = mpsc::channel();
+    let cancel = CancelFlag::new();
     let printer = std::thread::spawn(move || {
         while let Ok(event) = progress_rx.recv() {
             match event {
@@ -106,16 +152,29 @@ fn run_debug_mode(args: &Args, options: ScanOptions, settings: &AppSettings) -> 
         }
     });
 
-    let report = engine::run_scan(
+    install_debug_cancel_handler(cancel.clone())?;
+
+    let report = engine::run_scan_with_cancel(
         &args.target,
         options,
         settings.scan_cache_path.clone(),
         Some(progress_tx.clone()),
-    )?;
+        cancel,
+    );
     drop(progress_tx);
     let _ = printer.join();
-    print_report(&report);
-    Ok(())
+
+    match report {
+        Ok(report) => {
+            print_report(&report);
+            Ok(())
+        }
+        Err(err) if is_scan_cancelled(&err) => {
+            eprintln!("Scan cancelled.");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 // Used to store previous states for instant back navigation
@@ -347,15 +406,20 @@ fn start_scan_session(
         let scan_ctx = Arc::clone(&context);
         let tx_pool = msg_tx.clone();
         std::thread::spawn(move || {
-            directories.into_par_iter().for_each(|job| {
+            let _ = directories.into_par_iter().try_for_each(|job| {
                 if scan_ctx.cancel_flag().is_cancelled() {
-                    return;
+                    return Err(());
                 }
+
                 let ctx = Arc::clone(&scan_ctx);
                 let tx = tx_pool.clone();
                 tx.send(AppMessage::DirectoryStarted(job.path.clone())).ok();
-                let report = process_directory_child(job, &ctx);
+                let report = match process_directory_child(job, &ctx) {
+                    Ok(report) => report,
+                    Err(_) => return Err(()),
+                };
                 tx.send(AppMessage::DirectoryFinished(report)).ok();
+                Ok(())
             });
             tx_pool.send(AppMessage::AllDone).ok();
         });

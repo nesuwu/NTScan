@@ -23,6 +23,36 @@ use crate::model::{
     ScanErrorKind, ScanMode,
 };
 
+const CANCEL_CHECK_INTERVAL: usize = 64;
+
+#[derive(Debug)]
+struct ScanCancelled;
+
+impl std::fmt::Display for ScanCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("scan cancelled")
+    }
+}
+
+impl std::error::Error for ScanCancelled {}
+
+fn cancelled_error(context: &ScanContext) -> anyhow::Error {
+    context.note_cancelled();
+    anyhow!(ScanCancelled)
+}
+
+fn check_cancelled(context: &ScanContext) -> Result<()> {
+    if context.cancel_flag().is_cancelled() {
+        return Err(cancelled_error(context));
+    }
+    Ok(())
+}
+
+pub fn is_scan_cancelled(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<ScanCancelled>().is_some())
+}
+
 /// Scans a single directory, aggregating its total size and collecting children.
 ///
 /// This function performs the following steps:
@@ -34,6 +64,7 @@ use crate::model::{
 /// 4. **Aggregation**: Sums up the results from all children and local files to produce
 ///    a final `DirectoryReport`.
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
+    check_cancelled(context)?;
     context.emit(ProgressEvent::Started(path.to_path_buf()));
 
     let metadata = fs::metadata(path)
@@ -54,8 +85,18 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 
     let mut dir_entries: Vec<EntryReport> = directories
         .into_par_iter()
-        .map(|job| process_directory_child(job, context))
-        .collect();
+        .try_fold(Vec::new, |mut acc, job| -> Result<Vec<EntryReport>> {
+            check_cancelled(context)?;
+            acc.push(process_directory_child(job, context)?);
+            Ok(acc)
+        })
+        .try_reduce(
+            Vec::new,
+            |mut left, mut right| -> Result<Vec<EntryReport>> {
+                left.append(&mut right);
+                Ok(left)
+            },
+        )?;
 
     let directories_logical: u64 = dir_entries.iter().map(|entry| entry.logical_size).sum();
     let total_logical = file_logical + directories_logical;
@@ -119,6 +160,8 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 /// * **File Summation**: Accumulating the size of files directly to avoid overhead.
 /// * **Error Handling**: Capturing permission errors during iteration.
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
+    check_cancelled(context)?;
+
     let mut directories = Vec::new();
     let mut precomputed_entries = Vec::new();
     let mut file_logical = 0u64;
@@ -133,7 +176,11 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         })
         .with_context(|| format!("failed to read directory {}", path.display()))?;
 
-    for entry in read_dir {
+    for (index, entry) in read_dir.enumerate() {
+        if index % CANCEL_CHECK_INTERVAL == 0 {
+            check_cancelled(context)?;
+        }
+
         let entry = entry
             .inspect_err(|err| {
                 context.record_error(classify_io_error(err));
@@ -211,6 +258,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         };
 
         if meta.is_dir() {
+            check_cancelled(context)?;
             directories.push(ChildJob {
                 name,
                 path: entry_path,
@@ -220,7 +268,8 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         }
 
         if meta.is_file() {
-            let (logical, allocated) = accumulate_file_sizes(&entry_path, &meta, context);
+            check_cancelled(context)?;
+            let (logical, allocated) = accumulate_file_sizes(&entry_path, &meta, context)?;
 
             // Check if this file content is unique (hard-link detection for logical size)
             // This prevents double-counting when the same file appears at multiple paths
@@ -297,7 +346,9 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 }
 
 /// Recursively scans a subdirectory, handling symlink cycles if configured.
-pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryReport {
+pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<EntryReport> {
+    check_cancelled(context)?;
+
     if context.options().follow_symlinks
         && job.was_symlink
         && let Ok(canon) = fs::canonicalize(&job.path)
@@ -308,16 +359,17 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryRep
             String::from("cycle detected"),
         ));
         context.record_error(ScanErrorKind::Other);
-        return entry_with_error(
+        return Ok(entry_with_error(
             job.name,
             job.path,
             EntryKind::SymlinkDirectory,
             "skipped (already visited target)",
-        );
+        ));
     }
 
+    check_cancelled(context)?;
     match scan_directory(&job.path, context) {
-        Ok(report) => EntryReport {
+        Ok(report) => Ok(EntryReport {
             name: job.name,
             path: job.path,
             kind: if job.was_symlink {
@@ -332,18 +384,19 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> EntryRep
             ads_count: 0,
             error: None,
             modified: report.mtime,
-        },
+        }),
+        Err(err) if is_scan_cancelled(&err) => Err(err),
         Err(err) => {
             context.emit(ProgressEvent::EntryError {
                 path: job.path.clone(),
                 message: format!("directory scan failed: {}", err),
             });
-            entry_with_error(
+            Ok(entry_with_error(
                 job.name,
                 job.path,
                 EntryKind::Directory,
                 format!("directory scan failed: {}", err),
-            )
+            ))
         }
     }
 }
@@ -352,15 +405,17 @@ fn accumulate_file_sizes(
     path: &Path,
     meta: &Metadata,
     context: &ScanContext,
-) -> (u64, Option<u64>) {
+) -> Result<(u64, Option<u64>)> {
+    check_cancelled(context)?;
     let mut logical = meta.len();
     let mut allocated = None;
 
     if context.options().mode == ScanMode::Fast {
-        return (logical, None);
+        return Ok((logical, None));
     }
 
     if context.options().mode == ScanMode::Accurate {
+        check_cancelled(context)?;
         let mtime = meta.modified().ok();
 
         if let Some((cached_alloc, cached_ads_bytes, _)) =
@@ -368,9 +423,10 @@ fn accumulate_file_sizes(
         {
             logical += cached_ads_bytes;
             allocated = Some(cached_alloc);
-            return (logical, allocated);
+            return Ok((logical, allocated));
         }
 
+        check_cancelled(context)?;
         let mut ads_summary = AdsSummary::default();
         match collect_ads(path) {
             Ok(ads) => {
@@ -386,6 +442,7 @@ fn accumulate_file_sizes(
             }
         }
 
+        check_cancelled(context)?;
         let alloc_size = match get_allocated_size_fast(path) {
             Ok(size) => size,
             Err(err) => {
@@ -410,7 +467,7 @@ fn accumulate_file_sizes(
         );
     }
 
-    (logical, allocated)
+    Ok((logical, allocated))
 }
 
 fn get_allocated_size_fast(path: &Path) -> Result<u64> {
