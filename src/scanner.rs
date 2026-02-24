@@ -189,9 +189,9 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         let name = entry.file_name().to_string_lossy().to_string();
         let entry_path = entry.path();
 
-        // OPTIMIZATION: Use entry.metadata() to avoid re-querying the OS.
-        // This uses the data returned by FindNextFile (directory iteration) on Windows.
-        let symlink_metadata = match entry.metadata() {
+        // Use symlink metadata so reparse points (symlinks/junctions) stay visible.
+        // `metadata()` follows links and would hide the reparse bit.
+        let symlink_metadata = match fs::symlink_metadata(&entry_path) {
             Ok(meta) => meta,
             Err(err) => {
                 context.record_error(classify_io_error(&err));

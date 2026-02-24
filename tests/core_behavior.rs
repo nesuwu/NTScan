@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -10,11 +11,20 @@ use ntscan::scanner::{process_directory_child, scan_directory};
 use tempfile::TempDir;
 
 fn build_context(cache_home: &TempDir, mode: ScanMode, show_files: bool) -> ScanContext {
+    build_context_with_follow(cache_home, mode, false, show_files)
+}
+
+fn build_context_with_follow(
+    cache_home: &TempDir,
+    mode: ScanMode,
+    follow_symlinks: bool,
+    show_files: bool,
+) -> ScanContext {
     let cache_path = cache_home.path().join("scan-cache.bin");
     ScanContext::with_cache(
         ScanOptions {
             mode,
-            follow_symlinks: false,
+            follow_symlinks,
             show_files,
         },
         None,
@@ -26,6 +36,40 @@ fn build_context(cache_home: &TempDir, mode: ScanMode, show_files: bool) -> Scan
 
 fn build_fast_context(cache_home: &TempDir, show_files: bool) -> ScanContext {
     build_context(cache_home, ScanMode::Fast, show_files)
+}
+
+#[cfg(windows)]
+fn create_windows_dir_link(link: &Path, target: &Path) -> Result<()> {
+    use std::process::Command;
+
+    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        return Ok(());
+    }
+
+    let output = Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link.as_os_str())
+        .arg(target.as_os_str())
+        .output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to create directory link at {} -> {}: {}",
+        link.display(),
+        target.display(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    ))
+}
+
+#[cfg(unix)]
+fn create_unix_dir_link(link: &Path, target: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
 }
 
 #[test]
@@ -142,6 +186,116 @@ fn find_duplicates_respects_minimum_size_filter() -> Result<()> {
     assert_eq!(result.total_files_scanned, 1);
     assert!(result.groups.is_empty());
     assert_eq!(result.total_reclaimable, 0);
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn no_follow_symlinks_skips_windows_directory_links() -> Result<()> {
+    let root = TempDir::new()?;
+    let target_home = TempDir::new()?;
+    let target_dir = target_home.path().join("real-target");
+    fs::create_dir(&target_dir)?;
+    fs::write(target_dir.join("payload.bin"), vec![b'S'; 32])?;
+
+    let link_path = root.path().join("linked-target");
+    if let Err(err) = create_windows_dir_link(&link_path, &target_dir) {
+        eprintln!("skipping windows link test: {err}");
+        return Ok(());
+    }
+
+    let context = build_fast_context(&root, true);
+    let report = scan_directory(root.path(), &context)?;
+
+    assert_eq!(report.logical_size, 0);
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == link_path)
+        .expect("expected linked directory entry");
+    assert!(matches!(entry.kind, EntryKind::Skipped));
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("symlink not followed"),
+        "expected no-follow reason for skipped directory link",
+    );
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn follow_symlinks_detects_windows_directory_link_cycles() -> Result<()> {
+    let root = TempDir::new()?;
+    let nested = root.path().join("nested");
+    fs::create_dir(&nested)?;
+
+    let link_path = nested.join("back-to-root");
+    if let Err(err) = create_windows_dir_link(&link_path, root.path()) {
+        eprintln!("skipping windows cycle test: {err}");
+        return Ok(());
+    }
+
+    let context = build_context_with_follow(&root, ScanMode::Fast, true, true);
+    if let Ok(canon) = fs::canonicalize(root.path()) {
+        context.mark_if_new(canon);
+    }
+
+    let report = scan_directory(&nested, &context)?;
+    let cycle_entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == link_path)
+        .expect("expected cycle link entry");
+
+    assert!(matches!(cycle_entry.kind, EntryKind::SymlinkDirectory));
+    assert_eq!(cycle_entry.logical_size, 0);
+    assert!(
+        cycle_entry
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already visited target"),
+        "expected cycle-detection skip for followed directory link",
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn no_follow_symlinks_skips_directory_symlinks_on_unix() -> Result<()> {
+    let root = TempDir::new()?;
+    let target_home = TempDir::new()?;
+    let target_dir = target_home.path().join("real-target");
+    fs::create_dir(&target_dir)?;
+    fs::write(target_dir.join("payload.bin"), vec![b'U'; 16])?;
+
+    let link_path = root.path().join("linked-target");
+    create_unix_dir_link(&link_path, &target_dir)?;
+
+    let context = build_fast_context(&root, true);
+    let report = scan_directory(root.path(), &context)?;
+
+    assert_eq!(report.logical_size, 0);
+    let entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == link_path)
+        .expect("expected linked directory entry");
+    assert!(matches!(entry.kind, EntryKind::Skipped));
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("symlink not followed"),
+        "expected no-follow reason for skipped directory symlink",
+    );
 
     Ok(())
 }
