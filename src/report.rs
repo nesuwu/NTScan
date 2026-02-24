@@ -20,6 +20,7 @@ pub use crate::util::fmt_bytes as format_size;
 ///     mtime: None,
 ///     logical_size: 0,
 ///     allocated_size: None,
+///     allocated_complete: true,
 ///     entries: Vec::new(),
 /// };
 /// print_report(&report);
@@ -33,11 +34,7 @@ pub fn print_report(report: &DirectoryReport) {
 
     println!("Target: {}", report.path.display());
     println!("Logical total: {}", fmt_bytes(report.logical_size));
-    if let Some(allocated) = report.allocated_size {
-        println!("Allocated total: {}", fmt_bytes(allocated));
-    } else {
-        println!("Allocated total: n/a (fast mode or partial data)");
-    }
+    println!("{}", allocated_total_line(report));
     println!("Items: {}", report.entries.len());
     if skipped_count > 0 {
         println!("Skipped: {}", skipped_count);
@@ -79,5 +76,37 @@ pub fn print_report(report: &DirectoryReport) {
         if let Some(reason) = &entry.skip_reason {
             println!("    - skipped: {}", reason);
         }
+    }
+}
+
+fn allocated_total_line(report: &DirectoryReport) -> String {
+    match report.allocated_size {
+        Some(allocated) if report.allocated_complete => {
+            format!("Allocated total: {}", fmt_bytes(allocated))
+        }
+        Some(allocated) => {
+            format!("Allocated total (partial): {}", fmt_bytes(allocated))
+        }
+        None => String::from("Allocated total: n/a (fast mode)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_allocated_totals_are_labeled() {
+        let report = DirectoryReport {
+            path: std::path::PathBuf::from("."),
+            mtime: None,
+            logical_size: 0,
+            allocated_size: Some(4096),
+            allocated_complete: false,
+            entries: Vec::new(),
+        };
+
+        let line = allocated_total_line(&report);
+        assert!(line.contains("(partial)"));
     }
 }

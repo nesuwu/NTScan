@@ -103,6 +103,7 @@ pub struct DirectoryReport {
     pub mtime: Option<SystemTime>,
     pub logical_size: u64,
     pub allocated_size: Option<u64>,
+    pub allocated_complete: bool,
     pub entries: Vec<EntryReport>,
 }
 
@@ -114,6 +115,7 @@ pub struct EntryReport {
     pub kind: EntryKind,
     pub logical_size: u64,
     pub allocated_size: Option<u64>,
+    pub allocated_complete: bool,
     pub percent_of_parent: f64,
     pub ads_bytes: u64,
     pub ads_count: usize,
@@ -165,6 +167,7 @@ pub enum ProgressEvent {
         path: PathBuf,
         logical: u64,
         allocated: Option<u64>,
+        allocated_complete: bool,
     },
     EntryError {
         path: PathBuf,
@@ -187,6 +190,7 @@ pub struct DirectoryPlan {
     pub precomputed_entries: Vec<EntryReport>,
     pub file_logical: u64,
     pub file_allocated: Option<u64>,
+    pub file_allocated_complete: bool,
 }
 
 /// Summary of alternate data streams attached to a file.

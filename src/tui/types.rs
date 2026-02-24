@@ -257,10 +257,16 @@ impl RowData {
             Style::default().fg(palette.ok)
         };
         let logical_text = format_size(entry.logical_size);
-        let allocated_text = entry
-            .allocated_size
-            .map(format_size)
-            .unwrap_or_else(|| "-".to_string());
+        let allocated_text = match entry.allocated_size {
+            Some(allocated) => {
+                let mut text = format_size(allocated);
+                if !entry.allocated_complete {
+                    text.push_str(" (partial)");
+                }
+                text
+            }
+            None => "-".to_string(),
+        };
         let ads_text = if entry.ads_count > 0 {
             format_size(entry.ads_bytes)
         } else {

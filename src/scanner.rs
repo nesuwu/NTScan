@@ -25,6 +25,12 @@ use crate::model::{
 
 const CANCEL_CHECK_INTERVAL: usize = 64;
 
+#[cfg(test)]
+static FORCE_ALLOCATED_SIZE_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_ALLOCATED_SIZE_FAILURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug)]
 struct ScanCancelled;
 
@@ -88,6 +94,7 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         mut precomputed_entries,
         file_logical,
         file_allocated,
+        file_allocated_complete,
     } = plan;
 
     let mut dir_entries: Vec<EntryReport> = directories
@@ -112,8 +119,21 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         (ScanMode::Accurate, value) => value,
         _ => None,
     };
+    let mut allocated_complete = true;
 
-    if let Some(total) = total_allocated.as_mut() {
+    if context.options().mode == ScanMode::Accurate {
+        allocated_complete = file_allocated_complete;
+        if let Some(total) = total_allocated.as_mut() {
+            for entry in &dir_entries {
+                allocated_complete &= entry.allocated_complete;
+                if let Some(alloc) = entry.allocated_size {
+                    *total += alloc;
+                }
+            }
+        } else {
+            allocated_complete = false;
+        }
+    } else if let Some(total) = total_allocated.as_mut() {
         for entry in &dir_entries {
             if let Some(alloc) = entry.allocated_size {
                 *total += alloc;
@@ -142,6 +162,7 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         mtime,
         logical_size: total_logical,
         allocated_size: total_allocated,
+        allocated_complete,
         entries,
     };
 
@@ -149,6 +170,7 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         path: path.to_path_buf(),
         logical: report.logical_size,
         allocated: report.allocated_size,
+        allocated_complete: report.allocated_complete,
     });
 
     Ok(report)
@@ -176,6 +198,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         ScanMode::Fast => None,
         ScanMode::Accurate => Some(0u64),
     };
+    let mut file_allocated_complete = true;
 
     let read_dir = fs::read_dir(path)
         .with_context(|| format!("failed to read directory {}", path.display()))?;
@@ -269,7 +292,9 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
 
         if meta.is_file() {
             check_cancelled(context)?;
-            let (logical, allocated) = accumulate_file_sizes(&entry_path, &meta, context)?;
+            let (logical, allocated, allocated_complete) =
+                accumulate_file_sizes(&entry_path, &meta, context)?;
+            file_allocated_complete &= allocated_complete;
 
             // Check if this file content is unique (hard-link detection for logical size)
             // This prevents double-counting when the same file appears at multiple paths
@@ -301,7 +326,8 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
                 // Re-calculate ADS if necessary for the report?
                 // accumulate_file_sizes puts it in cache, so we can retrieve it if we want exact details in the entry.
                 // But `EntryReport` needs `ads_bytes` and `ads_count`.
-                // `accumulate_file_sizes` returns (logical, allocated), where logical INCLUDEs ADS bytes if in Accurate mode.
+                // `accumulate_file_sizes` returns (logical, allocated, allocated_complete),
+                // where logical INCLUDEs ADS bytes if in Accurate mode.
                 // But it doesn't return separate ADS stats.
 
                 // To get accurate ADS stats for the report entry, we might need to query the cache or re-check.
@@ -335,6 +361,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
                     kind: EntryKind::File,
                     logical_size: accounted_logical,
                     allocated_size: accounted_allocated,
+                    allocated_complete,
                     percent_of_parent: 0.0, // Calculated later
                     ads_bytes,
                     ads_count,
@@ -360,6 +387,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         precomputed_entries,
         file_logical,
         file_allocated,
+        file_allocated_complete,
     })
 }
 
@@ -397,6 +425,7 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
             },
             logical_size: report.logical_size,
             allocated_size: report.allocated_size,
+            allocated_complete: report.allocated_complete,
             percent_of_parent: 0.0,
             ads_bytes: 0,
             ads_count: 0,
@@ -428,13 +457,14 @@ fn accumulate_file_sizes(
     path: &Path,
     meta: &Metadata,
     context: &ScanContext,
-) -> Result<(u64, Option<u64>)> {
+) -> Result<(u64, Option<u64>, bool)> {
     check_cancelled(context)?;
     let mut logical = meta.len();
     let mut allocated = None;
+    let mut allocated_complete = true;
 
     if context.options().mode == ScanMode::Fast {
-        return Ok((logical, None));
+        return Ok((logical, None, allocated_complete));
     }
 
     if context.options().mode == ScanMode::Accurate {
@@ -446,7 +476,7 @@ fn accumulate_file_sizes(
         {
             logical += cached_ads_bytes;
             allocated = Some(cached_alloc);
-            return Ok((logical, allocated));
+            return Ok((logical, allocated, allocated_complete));
         }
 
         check_cancelled(context)?;
@@ -475,25 +505,37 @@ fn accumulate_file_sizes(
                     path: path.to_path_buf(),
                     message: format!("allocation size failed: {}", err),
                 });
+                allocated_complete = false;
                 0
             }
         };
         allocated = Some(alloc_size);
 
-        context.cache().insert_attributes(
-            path.to_path_buf(),
-            mtime,
-            meta.len(),
-            alloc_size,
-            ads_summary.total_bytes,
-            ads_summary.count,
-        );
+        // Avoid caching a synthetic zero when allocation lookup fails.
+        if allocated_complete {
+            context.cache().insert_attributes(
+                path.to_path_buf(),
+                mtime,
+                meta.len(),
+                alloc_size,
+                ads_summary.total_bytes,
+                ads_summary.count,
+            );
+        }
     }
 
-    Ok((logical, allocated))
+    Ok((logical, allocated, allocated_complete))
 }
 
 fn get_allocated_size_fast(path: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if FORCE_ALLOCATED_SIZE_FAILURE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow!(
+            "forced allocation lookup failure for {}",
+            path.display()
+        ));
+    }
+
     let wide = path_to_wide(path);
     unsafe {
         let mut high: u32 = 0;
@@ -521,6 +563,7 @@ fn entry_with_error(
         kind,
         logical_size: 0,
         allocated_size: None,
+        allocated_complete: true,
         percent_of_parent: 0.0,
         ads_bytes: 0,
         ads_count: 0,
@@ -542,6 +585,7 @@ fn entry_with_skip(
         kind,
         logical_size: 0,
         allocated_size: None,
+        allocated_complete: true,
         percent_of_parent: 0.0,
         ads_bytes: 0,
         ads_count: 0,
@@ -706,4 +750,89 @@ fn is_reparse_point(metadata: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     let attrs = metadata.file_attributes();
     (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+
+    use crate::context::{CancelFlag, ScanCache, ScanContext};
+    use crate::model::{EntryKind, ErrorStats, ScanErrorKind, ScanMode, ScanOptions};
+
+    struct ForcedAllocationFailureGuard;
+
+    impl ForcedAllocationFailureGuard {
+        fn enable() -> Self {
+            FORCE_ALLOCATED_SIZE_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for ForcedAllocationFailureGuard {
+        fn drop(&mut self) {
+            FORCE_ALLOCATED_SIZE_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn allocated_lookup_failure_marks_subtree_partial_without_crashing() {
+        let _lock = FORCE_ALLOCATED_SIZE_FAILURE_LOCK
+            .lock()
+            .expect("failed to acquire allocation failure test lock");
+        let _force_failure = ForcedAllocationFailureGuard::enable();
+
+        let root = tempdir().expect("failed to create temp directory");
+        let child_dir = root.path().join("child");
+        fs::create_dir(&child_dir).expect("failed to create child directory");
+        fs::write(root.path().join("root.bin"), b"root data").expect("failed to write root file");
+        fs::write(child_dir.join("leaf.bin"), b"leaf data").expect("failed to write child file");
+
+        let options = ScanOptions {
+            mode: ScanMode::Accurate,
+            follow_symlinks: false,
+            show_files: true,
+        };
+        let errors = ErrorStats::default();
+        let context = ScanContext::with_cache(
+            options,
+            None,
+            CancelFlag::new(),
+            errors,
+            Arc::new(ScanCache::default()),
+        );
+
+        let report = scan_directory(root.path(), &context).expect("scan should complete");
+        assert!(
+            report.logical_size > 0,
+            "logical size should still be collected even when allocation lookups fail"
+        );
+        assert!(
+            report.allocated_size.is_some(),
+            "allocated total should still be reported in accurate mode"
+        );
+        assert!(
+            !report.allocated_complete,
+            "root report must be marked partial when any allocation lookup fails"
+        );
+
+        let child_entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.path == child_dir && matches!(entry.kind, EntryKind::Directory))
+            .expect("expected child directory entry");
+        assert!(
+            !child_entry.allocated_complete,
+            "child subtree must be marked partial"
+        );
+
+        let error_snapshot = context.errors().snapshot();
+        assert!(
+            *error_snapshot.get(&ScanErrorKind::Other).unwrap_or(&0) >= 1,
+            "allocation lookup failures should be recorded as scan errors"
+        );
+    }
 }

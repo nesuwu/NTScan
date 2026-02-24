@@ -44,7 +44,13 @@ pub fn draw_app(frame: &mut Frame<'_>, app: &mut App) {
     let total_logical = app.total_logical();
     let allocated_text = app
         .total_allocated()
-        .map(format_size)
+        .map(|(allocated, complete)| {
+            let mut text = format_size(allocated);
+            if !complete {
+                text.push_str(" (partial)");
+            }
+            text
+        })
         .unwrap_or_else(|| String::from("n/a"));
     let header_lines = vec![
         Line::from(format!("Target: {}", app.target.display())),

@@ -126,14 +126,24 @@ fn run_debug_mode(args: &Args, options: ScanOptions, settings: &AppSettings) -> 
                     path,
                     logical,
                     allocated,
+                    allocated_complete,
                 } => {
                     if let Some(alloc) = allocated {
-                        eprintln!(
-                            "[done] {} (logical {}, allocated {})",
-                            path.display(),
-                            format_size(logical),
-                            format_size(alloc)
-                        );
+                        if allocated_complete {
+                            eprintln!(
+                                "[done] {} (logical {}, allocated {})",
+                                path.display(),
+                                format_size(logical),
+                                format_size(alloc)
+                            );
+                        } else {
+                            eprintln!(
+                                "[done] {} (logical {}, allocated {} (partial))",
+                                path.display(),
+                                format_size(logical),
+                                format_size(alloc)
+                            );
+                        }
                     } else {
                         eprintln!(
                             "[done] {} (logical {})",
@@ -378,6 +388,7 @@ fn start_scan_session(
         precomputed_entries,
         file_logical,
         file_allocated,
+        file_allocated_complete,
     } = prepare_directory_plan(&target, context.as_ref())
         .with_context(|| format!("failed to read {}", target.display()))?;
 
@@ -389,6 +400,7 @@ fn start_scan_session(
         static_entries: precomputed_entries,
         file_logical,
         file_allocated,
+        file_allocated_complete,
         mode: options.mode,
         cancel: cancel.clone(),
         errors: errors.clone(),

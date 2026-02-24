@@ -23,6 +23,7 @@ struct FfiDirectoryReport {
     modified_unix_secs: Option<i64>,
     logical_size: u64,
     allocated_size: Option<u64>,
+    allocated_complete: bool,
     entries: Vec<FfiEntryReport>,
 }
 
@@ -33,6 +34,7 @@ struct FfiEntryReport {
     kind: String,
     logical_size: u64,
     allocated_size: Option<u64>,
+    allocated_complete: bool,
     percent_of_parent: f64,
     ads_bytes: u64,
     ads_count: usize,
@@ -81,6 +83,7 @@ pub extern "C" fn ntscan_scan_directory_json(
             modified_unix_secs: unix_seconds(report.mtime),
             logical_size: report.logical_size,
             allocated_size: report.allocated_size,
+            allocated_complete: report.allocated_complete,
             entries: report
                 .entries
                 .into_iter()
@@ -90,6 +93,7 @@ pub extern "C" fn ntscan_scan_directory_json(
                     kind: entry_kind_name(entry.kind).to_string(),
                     logical_size: entry.logical_size,
                     allocated_size: entry.allocated_size,
+                    allocated_complete: entry.allocated_complete,
                     percent_of_parent: entry.percent_of_parent,
                     ads_bytes: entry.ads_bytes,
                     ads_count: entry.ads_count,

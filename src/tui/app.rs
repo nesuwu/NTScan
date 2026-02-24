@@ -9,6 +9,7 @@ pub struct AppParams {
     pub static_entries: Vec<EntryReport>,
     pub file_logical: u64,
     pub file_allocated: Option<u64>,
+    pub file_allocated_complete: bool,
     pub mode: ScanMode,
     pub cancel: CancelFlag,
     pub errors: ErrorStats,
@@ -34,6 +35,7 @@ pub struct App {
     static_entries: Vec<EntryReport>,
     file_logical: u64,
     file_allocated: Option<u64>,
+    file_allocated_complete: bool,
     start: Instant,
     completed_at: Option<Instant>,
     total_dirs: usize,
@@ -66,6 +68,7 @@ impl App {
             static_entries,
             file_logical,
             file_allocated,
+            file_allocated_complete,
             mode,
             cancel,
             errors,
@@ -92,6 +95,7 @@ impl App {
             static_entries,
             file_logical,
             file_allocated,
+            file_allocated_complete,
             start: Instant::now(),
             completed_at: None,
             total_dirs,
@@ -690,26 +694,27 @@ impl App {
         total
     }
 
-    pub fn total_allocated(&self) -> Option<u64> {
+    pub fn total_allocated(&self) -> Option<(u64, bool)> {
         match self.mode {
             ScanMode::Fast => None,
             ScanMode::Accurate => {
-                // FIX: Use unwrap_or(0) to ignore errors instead of returning None
                 let mut total = self.file_allocated.unwrap_or(0);
+                let mut complete = self.file_allocated_complete;
 
                 for entry in &self.static_entries {
                     total += entry.allocated_size.unwrap_or(0);
+                    complete &= entry.allocated_complete;
                 }
 
                 for directory in &self.directories {
                     if let DirectoryStatus::Finished(report) = &directory.status {
                         total += report.allocated_size.unwrap_or(0);
+                        complete &= report.allocated_complete;
                     } else {
-                        // If a directory is still pending/running, we genuinely can't know the total yet
                         return None;
                     }
                 }
-                Some(total)
+                Some((total, complete))
             }
         }
     }
@@ -759,15 +764,21 @@ impl App {
         let mut total_logical = self.file_logical;
         total_logical += entries.iter().map(|entry| entry.logical_size).sum::<u64>();
 
-        // FIX: Robust summation that doesn't fail if one entry is None
         let mut total_allocated = match (self.mode, self.file_allocated) {
             (ScanMode::Accurate, _) => Some(self.file_allocated.unwrap_or(0)),
             _ => None,
         };
+        let mut allocated_complete = true;
 
-        if let Some(acc) = total_allocated.as_mut() {
-            for entry in &entries {
-                *acc += entry.allocated_size.unwrap_or(0);
+        if self.mode == ScanMode::Accurate {
+            allocated_complete = self.file_allocated_complete;
+            if let Some(acc) = total_allocated.as_mut() {
+                for entry in &entries {
+                    *acc += entry.allocated_size.unwrap_or(0);
+                    allocated_complete &= entry.allocated_complete;
+                }
+            } else {
+                allocated_complete = false;
             }
         }
 
@@ -794,6 +805,7 @@ impl App {
             mtime,
             logical_size: total_logical,
             allocated_size: total_allocated,
+            allocated_complete,
             entries,
         })
     }
@@ -927,6 +939,16 @@ impl App {
         }
 
         if self.file_logical > 0 && !self.show_files {
+            let allocated_text = match self.file_allocated {
+                Some(allocated) => {
+                    let mut text = format_size(allocated);
+                    if !self.file_allocated_complete {
+                        text.push_str(" (partial)");
+                    }
+                    text
+                }
+                None => "-".to_string(),
+            };
             rows.push(RowData {
                 name: "[files]".to_string(),
                 name_key: "[files]".to_string(),
@@ -935,10 +957,7 @@ impl App {
                 type_label: "FILE".to_string(),
                 status: "DONE".to_string(),
                 logical_text: format_size(self.file_logical),
-                allocated_text: self
-                    .file_allocated
-                    .map(format_size)
-                    .unwrap_or_else(|| "-".to_string()),
+                allocated_text,
                 modified_text: "-".to_string(),
                 ads_text: "-".to_string(),
                 percent_text: if total_logical > 0 {
@@ -1023,5 +1042,53 @@ impl App {
             rows.push(row.clone().into_row(absolute_index == self.selected));
         }
         rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_allocated_marks_partial_when_any_entry_is_incomplete() {
+        let app = App::new(AppParams {
+            target: PathBuf::from("."),
+            directories: Vec::new(),
+            static_entries: vec![EntryReport {
+                name: "sample.bin".to_string(),
+                path: PathBuf::from(".\\sample.bin"),
+                kind: EntryKind::File,
+                logical_size: 10,
+                allocated_size: Some(8),
+                allocated_complete: false,
+                percent_of_parent: 0.0,
+                ads_bytes: 0,
+                ads_count: 0,
+                error: None,
+                skip_reason: None,
+                modified: None,
+            }],
+            file_logical: 0,
+            file_allocated: Some(4),
+            file_allocated_complete: true,
+            mode: ScanMode::Accurate,
+            cancel: CancelFlag::new(),
+            errors: ErrorStats::default(),
+            show_files: true,
+            delete_permanent: false,
+            msg_tx: None,
+            settings: AppSettings::default(),
+        });
+
+        let (total_allocated, allocated_complete) = app
+            .total_allocated()
+            .expect("accurate mode should produce allocated totals");
+        assert_eq!(total_allocated, 12);
+        assert!(!allocated_complete, "totals must be marked partial");
+
+        let report = app
+            .build_final_report()
+            .expect("app with no pending directories should build final report");
+        assert!(!report.allocated_complete);
     }
 }
