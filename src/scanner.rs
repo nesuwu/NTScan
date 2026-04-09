@@ -119,7 +119,10 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         (ScanMode::Accurate, value) => value,
         _ => None,
     };
-    let mut allocated_complete = true;
+    // Default to false: it is only meaningful when we actually collected
+    // allocation data (Accurate mode). The Accurate branch below sets it
+    // to file_allocated_complete and refines it per child.
+    let mut allocated_complete = false;
 
     if context.options().mode == ScanMode::Accurate {
         allocated_complete = file_allocated_complete;
@@ -176,33 +179,33 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
     Ok(report)
 }
 
-/// Reads a directory and segregates entries into sub-directories (for parallel scanning) and files/other (for immediate summation).
+/// Reads a directory and segregates entries into sub-directories (for parallel
+/// scanning) and files/other (for immediate summation).
 ///
-/// # Purpose
+/// The function runs in two phases:
 ///
-/// This function acts as the "map" phase of the scan. It iterates over the directory *once*,
-/// identifying which entries require a recursive scan (directories) and which can be
-/// processed immediately (files).
+/// 1. **Classification** (sequential) — iterates `read_dir` once, performing only
+///    lightweight metadata checks.  Directories are queued for later parallel
+///    recursion; files are collected with their resolved `Metadata` for Phase 2;
+///    errors and skipped entries are emitted immediately.
 ///
-/// It also handles:
-/// * **Symlink Resolution**: deciding whether to follow links based on `ScanOptions`.
-/// * **File Summation**: Accumulating the size of files directly to avoid overhead.
-/// * **Error Handling**: Capturing permission errors during iteration.
+/// 2. **File processing** (parallel above [`FILE_PARALLEL_THRESHOLD`]) — the
+///    expensive per-file work (allocation size, ADS enumeration, hard-link dedup)
+///    runs in parallel via rayon when the file count justifies the dispatch
+///    overhead.  This removes the bottleneck that previously serialised all file
+///    work when a single directory contains many thousands of entries (e.g. a
+///    Downloads or temp folder).
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
     check_cancelled(context)?;
 
     let mut directories = Vec::new();
     let mut precomputed_entries = Vec::new();
-    let mut file_logical = 0u64;
-    let mut file_allocated = match context.options().mode {
-        ScanMode::Fast => None,
-        ScanMode::Accurate => Some(0u64),
-    };
-    let mut file_allocated_complete = true;
+    let mut pending_files: Vec<PendingFile> = Vec::new();
 
     let read_dir = fs::read_dir(path)
         .with_context(|| format!("failed to read directory {}", path.display()))?;
 
+    // ── Phase 1: classify entries (sequential) ──────────────────────────
     for (index, entry) in read_dir.enumerate() {
         if index % CANCEL_CHECK_INTERVAL == 0 {
             check_cancelled(context)?;
@@ -213,7 +216,6 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         let entry_path = entry.path();
 
         // Use symlink metadata so reparse points (symlinks/junctions) stay visible.
-        // `metadata()` follows links and would hide the reparse bit.
         let symlink_metadata = match fs::symlink_metadata(&entry_path) {
             Ok(meta) => meta,
             Err(err) => {
@@ -232,10 +234,6 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
             }
         };
 
-        // Detect reparse points (symlinks AND junctions) - not just symlinks!
-        // Rust's is_symlink() only returns true for symbolic links, NOT for junctions.
-        // Windows junctions like "Documents and Settings" -> "Users" would otherwise
-        // be followed as regular directories, causing massive double-counting.
         let is_reparse_point = is_reparse_point(&symlink_metadata);
         let is_symlink = symlink_metadata.file_type().is_symlink() || is_reparse_point;
 
@@ -291,85 +289,12 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         }
 
         if meta.is_file() {
-            check_cancelled(context)?;
-            let (logical, allocated, allocated_complete) =
-                accumulate_file_sizes(&entry_path, &meta, context)?;
-            file_allocated_complete &= allocated_complete;
-
-            // Check if this file content is unique (hard-link detection for logical size)
-            // This prevents double-counting when the same file appears at multiple paths
-            // (common in Windows WinSxS, Installer, and other system directories)
-            let is_first_logical_instance = context.mark_file_unique_logical(&entry_path);
-            let accounted_logical = if is_first_logical_instance {
-                logical
-            } else {
-                0
-            };
-            file_logical += accounted_logical;
-
-            let mut accounted_allocated = allocated;
-            let mut is_first_alloc_instance = true;
-            if let Some(add) = allocated {
-                // Only count allocated size if this is the first time seeing this file ID (hard link check)
-                is_first_alloc_instance = context.mark_file_unique_allocation(&entry_path);
-                if is_first_alloc_instance {
-                    if let Some(total) = file_allocated.as_mut() {
-                        *total += add;
-                    }
-                } else {
-                    accounted_allocated = Some(0);
-                }
-            }
-
-            let is_hardlink_duplicate = !is_first_logical_instance || !is_first_alloc_instance;
-            if context.options().show_files {
-                // Re-calculate ADS if necessary for the report?
-                // accumulate_file_sizes puts it in cache, so we can retrieve it if we want exact details in the entry.
-                // But `EntryReport` needs `ads_bytes` and `ads_count`.
-                // `accumulate_file_sizes` returns (logical, allocated, allocated_complete),
-                // where logical INCLUDEs ADS bytes if in Accurate mode.
-                // But it doesn't return separate ADS stats.
-
-                // To get accurate ADS stats for the report entry, we might need to query the cache or re-check.
-                // Since we just called `accumulate_file_sizes`, the cache should be populated in Accurate mode.
-
-                let (ads_bytes, ads_count) = if context.options().mode == ScanMode::Accurate {
-                    context
-                        .cache()
-                        .get_attributes(&entry_path, meta.len(), meta.modified().ok())
-                        .map(|(_, bytes, count)| (bytes, count))
-                        .unwrap_or((0, 0))
-                } else {
-                    (0, 0)
-                };
-
-                // Note: `accumulate_file_sizes` returns `logical` which is `file_size + ads_size` in Accurate mode.
-                // In Fast mode, `logical` is just `file_size`.
-                // We should be consistent. `EntryReport.logical_size` usually matches what `accumulate_file_sizes` returns.
-
-                // Option A UX: still show duplicate hardlink entries, but make their accounted
-                // contribution explicit by zeroing size fields and appending a label.
-                let display_name = if is_hardlink_duplicate {
-                    format!("{name} (hardlink duplicate)")
-                } else {
-                    name
-                };
-
-                precomputed_entries.push(EntryReport {
-                    name: display_name,
-                    path: entry_path,
-                    kind: EntryKind::File,
-                    logical_size: accounted_logical,
-                    allocated_size: accounted_allocated,
-                    allocated_complete,
-                    percent_of_parent: 0.0, // Calculated later
-                    ads_bytes,
-                    ads_count,
-                    error: None,
-                    skip_reason: None,
-                    modified: meta.modified().ok(),
-                });
-            }
+            // Defer the expensive per-file work to Phase 2.
+            pending_files.push(PendingFile {
+                name,
+                path: entry_path,
+                meta,
+            });
             continue;
         }
 
@@ -382,12 +307,152 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
         context.record_error(ScanErrorKind::Other);
     }
 
+    // ── Phase 2: process files (parallel for large directories) ─────────
+    let initial_allocated = match context.options().mode {
+        ScanMode::Fast => None,
+        ScanMode::Accurate => Some(0u64),
+    };
+    let (file_logical, file_allocated, file_allocated_complete, file_entries) =
+        process_pending_files(&pending_files, initial_allocated, context)?;
+
+    precomputed_entries.extend(file_entries);
+
     Ok(DirectoryPlan {
         directories,
         precomputed_entries,
         file_logical,
         file_allocated,
         file_allocated_complete,
+    })
+}
+
+/// Lightweight pre-classified file info collected during Phase 1.
+/// The expensive work (allocation, ADS, dedup) is deferred to Phase 2.
+struct PendingFile {
+    name: String,
+    path: PathBuf,
+    meta: Metadata,
+}
+
+/// Per-file result produced by [`process_single_file`].
+struct FileResult {
+    accounted_logical: u64,
+    /// Amount to add to the directory's `file_allocated` total.
+    /// `None` in Fast mode (allocation not tracked).
+    alloc_add: Option<u64>,
+    allocated_complete: bool,
+    entry: Option<EntryReport>,
+}
+
+/// Minimum file count before rayon parallel dispatch kicks in.
+/// Below this threshold the sequential path avoids dispatch overhead.
+const FILE_PARALLEL_THRESHOLD: usize = 128;
+
+/// Processes a batch of files, switching between sequential and parallel
+/// execution depending on count.
+fn process_pending_files(
+    files: &[PendingFile],
+    initial_allocated: Option<u64>,
+    context: &ScanContext,
+) -> Result<(u64, Option<u64>, bool, Vec<EntryReport>)> {
+    if files.is_empty() {
+        let complete = context.options().mode == ScanMode::Accurate;
+        return Ok((0, initial_allocated, complete, Vec::new()));
+    }
+
+    let results: Vec<FileResult> = if files.len() >= FILE_PARALLEL_THRESHOLD {
+        files
+            .par_iter()
+            .map(|file| process_single_file(file, context))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        files
+            .iter()
+            .map(|file| process_single_file(file, context))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let mut file_logical = 0u64;
+    let mut file_allocated = initial_allocated;
+    let mut file_allocated_complete = context.options().mode == ScanMode::Accurate;
+    let mut entries = Vec::new();
+
+    for result in results {
+        file_logical += result.accounted_logical;
+        file_allocated_complete &= result.allocated_complete;
+        if let Some(add) = result.alloc_add {
+            if let Some(total) = file_allocated.as_mut() {
+                *total += add;
+            }
+        }
+        if let Some(entry) = result.entry {
+            entries.push(entry);
+        }
+    }
+
+    Ok((file_logical, file_allocated, file_allocated_complete, entries))
+}
+
+/// Processes a single file: computes sizes, checks hard-link dedup, and
+/// optionally builds an [`EntryReport`] for display.
+fn process_single_file(file: &PendingFile, context: &ScanContext) -> Result<FileResult> {
+    check_cancelled(context)?;
+
+    let (logical, allocated, allocated_complete) =
+        accumulate_file_sizes(&file.path, &file.meta, context)?;
+
+    let (is_first_logical, is_first_alloc) = context.mark_file_unique(&file.path);
+
+    let accounted_logical = if is_first_logical { logical } else { 0 };
+
+    // Mirror the original accounting: non-first alloc instances contribute 0
+    // so the total stays correct while the entry is still displayable.
+    let alloc_add = allocated.map(|a| if is_first_alloc { a } else { 0 });
+
+    let is_hardlink_duplicate = !is_first_logical || !is_first_alloc;
+
+    let entry = if context.options().show_files {
+        let (ads_bytes, ads_count) = if context.options().mode == ScanMode::Accurate {
+            context
+                .cache()
+                .get_attributes(&file.path, file.meta.len(), file.meta.modified().ok())
+                .map(|(_, bytes, count)| (bytes, count))
+                .unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+
+        let accounted_allocated = allocated.map(|a| if is_first_alloc { a } else { 0 });
+
+        let display_name = if is_hardlink_duplicate {
+            format!("{} (hardlink duplicate)", file.name)
+        } else {
+            file.name.clone()
+        };
+
+        Some(EntryReport {
+            name: display_name,
+            path: file.path.clone(),
+            kind: EntryKind::File,
+            logical_size: accounted_logical,
+            allocated_size: accounted_allocated,
+            allocated_complete,
+            percent_of_parent: 0.0,
+            ads_bytes,
+            ads_count,
+            error: None,
+            skip_reason: None,
+            modified: file.meta.modified().ok(),
+        })
+    } else {
+        None
+    };
+
+    Ok(FileResult {
+        accounted_logical,
+        alloc_add,
+        allocated_complete,
+        entry,
     })
 }
 
@@ -464,7 +529,7 @@ fn accumulate_file_sizes(
     let mut allocated_complete = true;
 
     if context.options().mode == ScanMode::Fast {
-        return Ok((logical, None, allocated_complete));
+        return Ok((logical, None, false));
     }
 
     if context.options().mode == ScanMode::Accurate {

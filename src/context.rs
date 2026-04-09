@@ -385,24 +385,64 @@ fn system_time_to_tuple(t: SystemTime) -> (u64, u32) {
     }
 }
 
-#[derive(Default)]
+const VISITED_SHARDS: usize = 64;
+
+/// Sharded visited-set to reduce lock contention under parallel scanning.
+///
+/// The previous single-`Mutex` design forced every rayon thread to serialize on
+/// one lock for every file's dedup check. With 64 shards, threads only contend
+/// when they happen to hash to the same bucket — which is rare enough to
+/// effectively eliminate the bottleneck.
 struct Visited {
-    state: Mutex<VisitedState>,
+    #[cfg(windows)]
+    id_shards: Vec<Mutex<VisitedIdShard>>,
+    path_shards: Vec<Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 #[cfg(windows)]
 #[derive(Default)]
-struct VisitedState {
-    paths: std::collections::HashSet<PathBuf>,
-    ids: std::collections::HashSet<FileIdentity>,
-    /// Tracks file identities for logical size deduplication (hard-link detection)
+struct VisitedIdShard {
+    alloc_ids: std::collections::HashSet<FileIdentity>,
     logical_ids: std::collections::HashSet<FileIdentity>,
 }
 
-#[cfg(not(windows))]
-#[derive(Default)]
-struct VisitedState {
-    paths: std::collections::HashSet<PathBuf>,
+impl Default for Visited {
+    fn default() -> Self {
+        let mut path_shards = Vec::with_capacity(VISITED_SHARDS);
+        for _ in 0..VISITED_SHARDS {
+            path_shards.push(Mutex::new(std::collections::HashSet::new()));
+        }
+
+        #[cfg(windows)]
+        let id_shards = {
+            let mut v = Vec::with_capacity(VISITED_SHARDS);
+            for _ in 0..VISITED_SHARDS {
+                v.push(Mutex::new(VisitedIdShard::default()));
+            }
+            v
+        };
+
+        Self {
+            #[cfg(windows)]
+            id_shards,
+            path_shards,
+        }
+    }
+}
+
+impl Visited {
+    fn path_shard_index(path: &Path) -> usize {
+        let mut s = DefaultHasher::new();
+        path.hash(&mut s);
+        (s.finish() as usize) & (VISITED_SHARDS - 1)
+    }
+
+    #[cfg(windows)]
+    fn id_shard_index(id: &FileIdentity) -> usize {
+        let mut s = DefaultHasher::new();
+        id.hash(&mut s);
+        (s.finish() as usize) & (VISITED_SHARDS - 1)
+    }
 }
 
 /// Shared context passed to scanning threads, containing options, cache, and synchronization primitives.
@@ -475,44 +515,76 @@ impl ScanContext {
         }
     }
 
-    /// Atomically checks if a file's unique identity (inode/FileID) has been seen before.
-    /// Returns `true` if this is the first time seeing this file content.
+    /// Checks if a file has been seen before for both logical and allocation dedup.
+    /// Returns `(is_first_logical, is_first_alloc)`.
     ///
-    /// This is used to prevent double-counting allocated size for hard links.
-    pub fn mark_file_unique_allocation(&self, path: &Path) -> bool {
-        // On Windows, strictly use FileIdentity (Volume + FileId) to detect hard links.
-        // On others, rely on canonical path (less robust for hard links but standard).
+    /// This calls `file_identity()` once and checks both dedup sets in a single
+    /// shard lock, halving the per-file kernel call overhead compared to two
+    /// separate identity lookups.
+    pub fn mark_file_unique(&self, path: &Path) -> (bool, bool) {
         #[cfg(windows)]
         {
             if let Some(id) = file_identity(path) {
-                let mut state = self.visited.state.lock().unwrap();
-                return state.ids.insert(id);
+                let idx = Visited::id_shard_index(&id);
+                let mut shard = self.visited.id_shards[idx].lock().unwrap();
+                let logical_new = shard.logical_ids.insert(id);
+                let alloc_new = shard.alloc_ids.insert(id);
+                return (logical_new, alloc_new);
             }
         }
 
-        // Fallback if ID retrieval fails or on non-Windows
-        if let Ok(normalized) = fs::canonicalize(path) {
-            let mut state = self.visited.state.lock().unwrap();
-            return state.paths.insert(normalized);
+        // Fallback for non-Windows or if ID retrieval fails
+        #[cfg(not(windows))]
+        {
+            if let Ok(normalized) = fs::canonicalize(path) {
+                let idx = Visited::path_shard_index(&normalized);
+                let mut shard = self.visited.path_shards[idx].lock().unwrap();
+                let alloc_new = shard.insert(normalized);
+                return (true, alloc_new);
+            }
+            return (true, true);
         }
 
-        // Last resort: raw path (unlikely to be effective for dedup but safe default)
-        let mut state = self.visited.state.lock().unwrap();
-        state.paths.insert(path.to_path_buf())
+        // Windows fallback when file_identity fails: use canonical path for alloc,
+        // always count logical (safe over-count)
+        #[cfg(windows)]
+        {
+            if let Ok(normalized) = fs::canonicalize(path) {
+                let idx = Visited::path_shard_index(&normalized);
+                let mut shard = self.visited.path_shards[idx].lock().unwrap();
+                let alloc_new = shard.insert(normalized);
+                return (true, alloc_new);
+            }
+            (true, true)
+        }
     }
 
     /// Atomically checks if a path has been visited and marks it.
     /// Returns `true` if the path is new (not previously visited).
     ///
     /// This method is critical for preventing infinite loops when following symbolic links.
+    /// Note: canonicalize is intentionally kept here because symlink targets need resolution.
     pub fn mark_if_new(&self, path: PathBuf) -> bool {
         let normalized = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         let identity = file_identity(&normalized).or_else(|| file_identity(&path));
 
-        let mut state = self.visited.state.lock().unwrap();
-        let by_path = state.paths.insert(normalized);
+        let path_idx = Visited::path_shard_index(&normalized);
+        let by_path = self.visited.path_shards[path_idx]
+            .lock()
+            .unwrap()
+            .insert(normalized);
+
         #[cfg(windows)]
-        let by_id = identity.map(|id| state.ids.insert(id)).unwrap_or(false);
+        let by_id = identity
+            .map(|id| {
+                let id_idx = Visited::id_shard_index(&id);
+                self.visited.id_shards[id_idx]
+                    .lock()
+                    .unwrap()
+                    .alloc_ids
+                    .insert(id)
+            })
+            .unwrap_or(false);
         #[cfg(not(windows))]
         let by_id = identity.is_some();
         by_path || by_id
@@ -559,30 +631,6 @@ impl ScanContext {
     pub fn record_error(&self, kind: ScanErrorKind) {
         self.errors.record(kind);
     }
-
-    /// Atomically checks if a file's unique identity has been seen before for logical size.
-    /// Returns `true` if this is the first time seeing this file content.
-    ///
-    /// This is used to prevent double-counting logical size for hard-linked files.
-    /// Windows system directories (WinSxS, Installer, etc.) contain many hard links,
-    /// which would otherwise inflate the reported size far beyond actual disk usage.
-    pub fn mark_file_unique_logical(&self, path: &Path) -> bool {
-        #[cfg(windows)]
-        {
-            if let Some(id) = file_identity(path) {
-                let mut state = self.visited.state.lock().unwrap();
-                return state.logical_ids.insert(id);
-            }
-        }
-
-        // Fallback for non-Windows or if ID retrieval fails: always count
-        // This is safe (may over-count) but avoids under-counting on failure
-        #[cfg(not(windows))]
-        {
-            let _ = path;
-        }
-        true
-    }
 }
 
 #[cfg(windows)]
@@ -608,11 +656,23 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
         };
         use windows::core::PCWSTR;
 
-        // 1. Canonicalize path to handle relative paths, dots, and ensure \\?\ prefix for long paths.
-        // This is critical because CreateFileW is strict about paths when using \\?\.
-        let safe_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let mut wide_path: Vec<u16> = safe_path.as_os_str().encode_wide().collect();
-        wide_path.push(0);
+        // Paths from read_dir() are already absolute. Avoid the expensive
+        // fs::canonicalize() call (multiple kernel round-trips on Windows).
+        // CreateFileW handles absolute paths fine; we only need the \\?\ prefix
+        // for paths longer than MAX_PATH (260 chars).
+        let needs_long_prefix = path.as_os_str().len() > 248
+            && !path.to_string_lossy().starts_with("\\\\?\\");
+        let wide_path: Vec<u16> = if needs_long_prefix {
+            let mut prefixed = std::ffi::OsString::from("\\\\?\\");
+            prefixed.push(path.as_os_str());
+            let mut w: Vec<u16> = prefixed.encode_wide().collect();
+            w.push(0);
+            w
+        } else {
+            let mut w: Vec<u16> = path.as_os_str().encode_wide().collect();
+            w.push(0);
+            w
+        };
 
         // 2. Open with 0 access rights. This allows opening file for metadata query
         // even if we lack Read/Write permissions (e.g., locked system files).

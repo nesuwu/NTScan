@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 #[cfg(windows)]
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -187,10 +187,33 @@ fn run_debug_mode(args: &Args, options: ScanOptions, settings: &AppSettings) -> 
     }
 }
 
-// Used to store previous states for instant back navigation
+// Used to store previous states for instant back navigation.
+//
+// Two mtimes are stored to catch different classes of change:
+//
+//   `snapshot_mtime`       — mtime of this directory itself at the moment we
+//                            navigated away.  Catches additions/removals of
+//                            direct children (new file, renamed entry, etc.).
+//
+//   `child_snapshot_mtime` — mtime of the *child directory we navigated into*.
+//                            Catches modifications made inside that child while
+//                            we were browsing it (deleted files, new files, etc.).
+//                            NTFS updates the child's mtime on such changes but
+//                            does NOT update the parent's mtime.
 struct NavigationState {
+    target: PathBuf,
+    snapshot_mtime: Option<SystemTime>,
+    /// Path of the child directory we descended into.
+    child_path: PathBuf,
+    /// Mtime of that child at the time we navigated into it.
+    child_snapshot_mtime: Option<SystemTime>,
     app: App,
     msg_rx: mpsc::Receiver<AppMessage>,
+}
+
+/// Reads a directory's mtime for staleness comparison.
+fn dir_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 /// Executes the interactive TUI mode.
@@ -249,11 +272,19 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
             if let Some(act) = action {
                 match act {
                     AppAction::ChangeDirectory(target) => {
-                        // Save state before leaving
-                        app.request_cancel();
-                        let _ = context.save_cache(); // Partial save on navigation
+                        // Snapshot both this directory's mtime AND the child we're
+                        // about to enter. On GoBack we check both:
+                        //  - parent mtime catches new/removed direct children
+                        //  - child mtime catches files deleted/added inside the child
+                        //    (NTFS only bumps the child's mtime, not the parent's)
+                        let snapshot_mtime = dir_mtime(app.target());
+                        let snapshot_target = app.target().to_path_buf();
+                        let child_snapshot_mtime = dir_mtime(&target);
+                        let child_path = target.clone();
 
-                        // Start new scan
+                        app.request_cancel();
+                        let _ = context.save_cache();
+
                         let (next_app, next_context, next_rx) = start_scan_session(
                             target,
                             options,
@@ -262,51 +293,156 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                             settings.clone(),
                         )?;
 
-                        // Push OLD state to history
-                        let old_state = NavigationState { app, msg_rx };
+                        let old_state = NavigationState {
+                            target: snapshot_target,
+                            snapshot_mtime,
+                            child_path,
+                            child_snapshot_mtime,
+                            app,
+                            msg_rx,
+                        };
                         history.push(old_state);
 
-                        // Switch to NEW state
                         app = next_app;
                         context = next_context;
                         msg_rx = next_rx;
                         last_tick = Instant::now();
                     }
                     AppAction::GoBack => {
-                        // 1. Try In-Memory History (Instant)
+                        let mut restored = false;
                         if let Some(state) = history.pop() {
-                            app = state.app;
-                            msg_rx = state.msg_rx;
+                            let current_mtime = dir_mtime(&state.target);
+                            let parent_fresh = match (state.snapshot_mtime, current_mtime) {
+                                (Some(snap), Some(curr)) => snap == curr,
+                                _ => false,
+                            };
 
-                            // Restore dummy context
-                            context = Arc::new(ScanContext::with_cache(
-                                options,
-                                None,
-                                CancelFlag::new(),
-                                ErrorStats::default(),
-                                Arc::clone(&shared_cache),
-                            ));
+                            let child_current_mtime = dir_mtime(&state.child_path);
+                            let child_fresh = match (state.child_snapshot_mtime, child_current_mtime) {
+                                (Some(snap), Some(curr)) => snap == curr,
+                                _ => false,
+                            };
 
-                            last_tick = Instant::now();
+                            let scan_complete = state.app.is_scan_complete();
+
+                            if parent_fresh && child_fresh && scan_complete {
+                                // ── Fast path ───────────────────────────
+                                // Nothing changed, restore instantly.
+                                app = state.app;
+                                msg_rx = state.msg_rx;
+
+                                context = Arc::new(ScanContext::with_cache(
+                                    options,
+                                    None,
+                                    CancelFlag::new(),
+                                    ErrorStats::default(),
+                                    Arc::clone(&shared_cache),
+                                ));
+
+                                last_tick = Instant::now();
+                                restored = true;
+                            } else if parent_fresh && scan_complete && !child_fresh {
+                                // ── Surgical path ───────────────────────
+                                // Only the child we were browsing changed
+                                // (e.g. files deleted inside it).  Restore
+                                // the parent, keep all other directories'
+                                // cached results, and re-scan only the
+                                // modified child.
+                                let new_cancel = CancelFlag::new();
+                                let (new_tx, new_rx) = mpsc::channel();
+
+                                let mut restored_app = state.app;
+                                if let Some(job) = restored_app.invalidate_child_for_rescan(
+                                    &state.child_path,
+                                    new_cancel.clone(),
+                                    new_tx.clone(),
+                                ) {
+                                    let scan_ctx = Arc::new(ScanContext::with_cache(
+                                        options,
+                                        None,
+                                        new_cancel,
+                                        restored_app.errors().clone(),
+                                        Arc::clone(&shared_cache),
+                                    ));
+
+                                    // Mark the parent as visited for symlink
+                                    // cycle detection (same as start_scan_session).
+                                    if options.follow_symlinks {
+                                        if let Ok(canon) = std::fs::canonicalize(&state.target) {
+                                            scan_ctx.mark_if_new(canon);
+                                        }
+                                    }
+
+                                    let ctx = Arc::clone(&scan_ctx);
+                                    let tx = new_tx.clone();
+                                    std::thread::spawn(move || {
+                                        tx.send(AppMessage::DirectoryStarted(
+                                            job.path.clone(),
+                                        ))
+                                        .ok();
+                                        match process_directory_child(job, &ctx) {
+                                            Ok(report) => {
+                                                tx.send(AppMessage::DirectoryFinished(report)).ok();
+                                            }
+                                            Err(_) => {}
+                                        }
+                                        tx.send(AppMessage::AllDone).ok();
+                                    });
+                                    drop(new_tx);
+
+                                    app = restored_app;
+                                    msg_rx = new_rx;
+                                    context = scan_ctx;
+                                    last_tick = Instant::now();
+                                    restored = true;
+                                }
+                                // If invalidate_child_for_rescan returned None
+                                // (shouldn't happen), fall through to full re-scan.
+                            }
+
+                            if !restored {
+                                // ── Full re-scan ────────────────────────
+                                // Parent listing changed, scan was incomplete,
+                                // or surgical path fell through.
+                                app.request_cancel();
+                                let _ = context.save_cache();
+
+                                let (next_app, next_context, next_rx) = start_scan_session(
+                                    state.target,
+                                    options,
+                                    Arc::clone(&shared_cache),
+                                    delete_permanent,
+                                    settings.clone(),
+                                )?;
+
+                                app = next_app;
+                                context = next_context;
+                                msg_rx = next_rx;
+                                last_tick = Instant::now();
+                                restored = true;
+                            }
                         }
-                        // 2. Fallback to Parent Directory (New Scan)
-                        else if let Some(parent) = app.target().parent() {
-                            let target = parent.to_path_buf();
-                            app.request_cancel();
-                            let _ = context.save_cache();
 
-                            let (next_app, next_context, next_rx) = start_scan_session(
-                                target,
-                                options,
-                                Arc::clone(&shared_cache),
-                                delete_permanent,
-                                settings.clone(),
-                            )?;
+                        // No history at all — scan the parent directory.
+                        if !restored {
+                            if let Some(parent) = app.target().parent() {
+                                let target = parent.to_path_buf();
+                                app.request_cancel();
+                                let _ = context.save_cache();
 
-                            app = next_app;
-                            context = next_context;
-                            msg_rx = next_rx;
-                            last_tick = Instant::now();
+                                let (next_app, next_context, next_rx) = start_scan_session(
+                                    target,
+                                    options,
+                                    Arc::clone(&shared_cache),
+                                    delete_permanent,
+                                    settings.clone(),
+                                )?;
+
+                                app = next_app;
+                                context = next_context;
+                                msg_rx = next_rx;
+                                last_tick = Instant::now();
+                            }
                         }
                     }
                     AppAction::ApplySettings(new_settings) => {

@@ -676,6 +676,52 @@ impl App {
         self.should_quit
     }
 
+    /// Returns `true` when every directory has reported in and the
+    /// background scan thread has sent `AllDone`.
+    ///
+    /// Used by the navigation layer to decide whether a history entry
+    /// can safely be restored: an incomplete App paired with a dead
+    /// message channel would leave entries stuck in "WAIT"/"SCAN" forever.
+    pub fn is_scan_complete(&self) -> bool {
+        self.all_done
+    }
+
+    /// Resets a single child directory back to `Pending` and wires up a
+    /// fresh cancel flag and message channel so a targeted re-scan can
+    /// deliver updates.  Returns the [`ChildJob`] needed to start that
+    /// scan, or `None` if the path wasn't found in `self.directories`.
+    ///
+    /// All other directories keep their cached `Finished` results, so the
+    /// user sees instant data for the unchanged entries and a quick
+    /// re-scan for the one that was modified.
+    pub fn invalidate_child_for_rescan(
+        &mut self,
+        child_path: &Path,
+        cancel: CancelFlag,
+        msg_tx: mpsc::Sender<AppMessage>,
+    ) -> Option<ChildJob> {
+        let dir = self.directories.iter_mut().find(|d| d.path == child_path)?;
+
+        let job = ChildJob {
+            name: dir.name.clone(),
+            path: dir.path.clone(),
+            was_symlink: dir.was_symlink,
+        };
+
+        if matches!(dir.status, DirectoryStatus::Finished(_)) {
+            self.completed_dirs = self.completed_dirs.saturating_sub(1);
+        }
+        dir.status = DirectoryStatus::Pending;
+
+        self.all_done = false;
+        self.completed_at = None;
+        self.cancel = cancel;
+        self.msg_tx = Some(msg_tx);
+        self.rows_dirty = true;
+
+        Some(job)
+    }
+
     pub fn total_logical(&self) -> u64 {
         let mut total = self.file_logical;
         total += self

@@ -1,13 +1,13 @@
 [package]
 name = "ntscan"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["tui"]
+default = ["tui", "ffi"]
 tui = ["dep:crossterm", "dep:ratatui", "dep:trash"]
 ffi = ["dep:serde", "dep:serde_json"]
 
