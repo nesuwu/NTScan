@@ -660,8 +660,8 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
         // fs::canonicalize() call (multiple kernel round-trips on Windows).
         // CreateFileW handles absolute paths fine; we only need the \\?\ prefix
         // for paths longer than MAX_PATH (260 chars).
-        let needs_long_prefix = path.as_os_str().len() > 248
-            && !path.to_string_lossy().starts_with("\\\\?\\");
+        let needs_long_prefix =
+            path.as_os_str().len() > 248 && !path.to_string_lossy().starts_with("\\\\?\\");
         let wide_path: Vec<u16> = if needs_long_prefix {
             let mut prefixed = std::ffi::OsString::from("\\\\?\\");
             prefixed.push(path.as_os_str());

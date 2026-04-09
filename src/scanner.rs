@@ -380,17 +380,22 @@ fn process_pending_files(
     for result in results {
         file_logical += result.accounted_logical;
         file_allocated_complete &= result.allocated_complete;
-        if let Some(add) = result.alloc_add {
-            if let Some(total) = file_allocated.as_mut() {
-                *total += add;
-            }
+        if let Some(add) = result.alloc_add
+            && let Some(total) = file_allocated.as_mut()
+        {
+            *total += add;
         }
         if let Some(entry) = result.entry {
             entries.push(entry);
         }
     }
 
-    Ok((file_logical, file_allocated, file_allocated_complete, entries))
+    Ok((
+        file_logical,
+        file_allocated,
+        file_allocated_complete,
+        entries,
+    ))
 }
 
 /// Processes a single file: computes sizes, checks hard-link dedup, and

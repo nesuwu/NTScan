@@ -318,10 +318,11 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                             };
 
                             let child_current_mtime = dir_mtime(&state.child_path);
-                            let child_fresh = match (state.child_snapshot_mtime, child_current_mtime) {
-                                (Some(snap), Some(curr)) => snap == curr,
-                                _ => false,
-                            };
+                            let child_fresh =
+                                match (state.child_snapshot_mtime, child_current_mtime) {
+                                    (Some(snap), Some(curr)) => snap == curr,
+                                    _ => false,
+                                };
 
                             let scan_complete = state.app.is_scan_complete();
 
@@ -367,24 +368,19 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
 
                                     // Mark the parent as visited for symlink
                                     // cycle detection (same as start_scan_session).
-                                    if options.follow_symlinks {
-                                        if let Ok(canon) = std::fs::canonicalize(&state.target) {
-                                            scan_ctx.mark_if_new(canon);
-                                        }
+                                    if options.follow_symlinks
+                                        && let Ok(canon) = std::fs::canonicalize(&state.target)
+                                    {
+                                        scan_ctx.mark_if_new(canon);
                                     }
 
                                     let ctx = Arc::clone(&scan_ctx);
                                     let tx = new_tx.clone();
                                     std::thread::spawn(move || {
-                                        tx.send(AppMessage::DirectoryStarted(
-                                            job.path.clone(),
-                                        ))
-                                        .ok();
-                                        match process_directory_child(job, &ctx) {
-                                            Ok(report) => {
-                                                tx.send(AppMessage::DirectoryFinished(report)).ok();
-                                            }
-                                            Err(_) => {}
+                                        tx.send(AppMessage::DirectoryStarted(job.path.clone()))
+                                            .ok();
+                                        if let Ok(report) = process_directory_child(job, &ctx) {
+                                            tx.send(AppMessage::DirectoryFinished(report)).ok();
                                         }
                                         tx.send(AppMessage::AllDone).ok();
                                     });
@@ -424,25 +420,23 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                         }
 
                         // No history at all — scan the parent directory.
-                        if !restored {
-                            if let Some(parent) = app.target().parent() {
-                                let target = parent.to_path_buf();
-                                app.request_cancel();
-                                let _ = context.save_cache();
+                        if !restored && let Some(parent) = app.target().parent() {
+                            let target = parent.to_path_buf();
+                            app.request_cancel();
+                            let _ = context.save_cache();
 
-                                let (next_app, next_context, next_rx) = start_scan_session(
-                                    target,
-                                    options,
-                                    Arc::clone(&shared_cache),
-                                    delete_permanent,
-                                    settings.clone(),
-                                )?;
+                            let (next_app, next_context, next_rx) = start_scan_session(
+                                target,
+                                options,
+                                Arc::clone(&shared_cache),
+                                delete_permanent,
+                                settings.clone(),
+                            )?;
 
-                                app = next_app;
-                                context = next_context;
-                                msg_rx = next_rx;
-                                last_tick = Instant::now();
-                            }
+                            app = next_app;
+                            context = next_context;
+                            msg_rx = next_rx;
+                            last_tick = Instant::now();
                         }
                     }
                     AppAction::ApplySettings(new_settings) => {
