@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -151,7 +151,7 @@ fn open_or_recreate_hash_db(path: &Path) -> std::io::Result<Database> {
         Err(_) => {
             let _ = fs::remove_file(path);
             Database::create(path)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         }
     }
 }

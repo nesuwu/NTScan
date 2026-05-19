@@ -269,11 +269,11 @@ fn load_into_shards(
 fn write_snapshot(db: &Database, snapshot: &[(String, CachedAttributes)]) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     {
         let mut table = write_txn
             .open_table(SCAN_TABLE)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         for (path_str, attr) in snapshot {
             let mut bytes = [0u8; 44];
             bytes[0..8].copy_from_slice(&attr.mtime_sec.to_le_bytes());
@@ -284,12 +284,12 @@ fn write_snapshot(db: &Database, snapshot: &[(String, CachedAttributes)]) -> io:
             bytes[36..44].copy_from_slice(&attr.file_id.to_le_bytes());
             table
                 .insert(path_str.as_str(), &bytes[..])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
     }
     write_txn
         .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// Opens or creates the redb database. If the file exists but is corrupt/old-format,
@@ -299,8 +299,7 @@ fn open_or_recreate_db(path: &Path) -> io::Result<Database> {
         Ok(db) => Ok(db),
         Err(_) => {
             let _ = fs::remove_file(path);
-            Database::create(path)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            Database::create(path).map_err(|e| io::Error::other(e.to_string()))
         }
     }
 }
@@ -430,7 +429,14 @@ impl ScanContext {
         errors: ErrorStats,
         cache: Arc<ScanCache>,
     ) -> Self {
-        Self::with_caches(options, progress, cancel, errors, cache, Arc::new(DirScanCache::default()))
+        Self::with_caches(
+            options,
+            progress,
+            cancel,
+            errors,
+            cache,
+            Arc::new(DirScanCache::default()),
+        )
     }
 
     /// Creates a new ScanContext with explicit file-level and directory-level caches.

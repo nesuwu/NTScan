@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableTable, TableDefinition};
@@ -104,8 +104,9 @@ impl Default for DirScanCache {
 
 impl DirScanCache {
     pub fn new(path: PathBuf) -> Self {
-        let shards: Vec<Mutex<HashMap<String, Slot>>> =
-            (0..NUM_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
+        let shards: Vec<Mutex<HashMap<String, Slot>>> = (0..NUM_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect();
 
         if let Ok(db) = Database::open(&path) {
             let _ = load(&db, &shards);
@@ -181,7 +182,10 @@ impl DirScanCache {
         };
 
         let key = normalize(path);
-        self.shards[shard_index(&key)].lock().unwrap().insert(key, slot);
+        self.shards[shard_index(&key)]
+            .lock()
+            .unwrap()
+            .insert(key, slot);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
@@ -243,11 +247,11 @@ fn load(db: &Database, shards: &[Mutex<HashMap<String, Slot>>]) -> io::Result<()
 fn write_snapshot(db: &Database, snapshot: &[(String, Slot)]) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     {
         let mut table = write_txn
             .open_table(DIR_TABLE)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         for (key, slot) in snapshot {
             let mut bytes = [0u8; ENTRY_BYTES];
             bytes[0..8].copy_from_slice(&slot.mtime_sec.to_le_bytes());
@@ -257,12 +261,12 @@ fn write_snapshot(db: &Database, snapshot: &[(String, Slot)]) -> io::Result<()> 
             bytes[28] = slot.flags;
             table
                 .insert(key.as_str(), &bytes[..])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
     }
     write_txn
         .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        .map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn open_or_recreate(path: &Path) -> io::Result<Database> {
@@ -270,8 +274,7 @@ fn open_or_recreate(path: &Path) -> io::Result<Database> {
         Ok(db) => Ok(db),
         Err(_) => {
             let _ = fs::remove_file(path);
-            Database::create(path)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            Database::create(path).map_err(|e| io::Error::other(e.to_string()))
         }
     }
 }

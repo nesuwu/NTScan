@@ -19,10 +19,10 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FIND_FIRST_EX_LARGE_FETCH, FileStandardInfo, FindClose, FindExInfoBasic,
-    FindExSearchNameMatch, FindFirstFileExW, FindFirstStreamW, FindNextFileW, FindNextStreamW,
-    GetCompressedFileSizeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
+    FIND_FIRST_EX_LARGE_FETCH, FileStandardInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+    FindFirstFileExW, FindFirstStreamW, FindNextFileW, FindNextStreamW, GetCompressedFileSizeW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING, STREAM_INFO_LEVELS,
+    WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
 };
 use windows::core::{HRESULT, PCWSTR};
 
@@ -432,8 +432,7 @@ impl Iterator for WinDirIter {
             if name == "." || name == ".." {
                 continue;
             }
-            let len =
-                ((self.data.nFileSizeHigh as u64) << 32) | (self.data.nFileSizeLow as u64);
+            let len = ((self.data.nFileSizeHigh as u64) << 32) | (self.data.nFileSizeLow as u64);
             return Some(Ok(RawEntry {
                 name,
                 attributes: self.data.dwFileAttributes,
@@ -704,7 +703,10 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
     // applied here (not in scan_directory_inner) so that direct scan_directory
     // callers (tests, CLI) always get fully-populated entries.
     let dir_mtime = fs::metadata(&job.path).ok().and_then(|m| m.modified().ok());
-    if let Some(cached) = context.dir_cache().get(&job.path, dir_mtime, context.options().mode) {
+    if let Some(cached) = context
+        .dir_cache()
+        .get(&job.path, dir_mtime, context.options().mode)
+    {
         if context.has_progress() {
             context.emit(ProgressEvent::CacheHit(job.path.clone()));
         }
@@ -826,6 +828,10 @@ fn read_identity(handle: HANDLE) -> Option<(u64, u64)> {
     }
 }
 
+/// Result of [`file_metrics`]: logical size, allocation size (if computed),
+/// whether allocation is complete, hard-link identity, and ADS summary.
+type FileMetrics = (u64, Option<u64>, bool, Option<(u64, u64)>, AdsSummary);
+
 /// Computes logical size, allocation size, hard-link identity and ADS for a
 /// file. In Accurate mode this opens **one** handle and reuses it for the
 /// identity read, ADS enumeration and (on `GetCompressedFileSizeW` failure)
@@ -834,7 +840,7 @@ fn file_metrics(
     path: &Path,
     info: &EntryInfo,
     context: &ScanContext,
-) -> Result<(u64, Option<u64>, bool, Option<(u64, u64)>, AdsSummary)> {
+) -> Result<FileMetrics> {
     check_cancelled(context)?;
 
     if context.options().mode == ScanMode::Fast {
@@ -849,8 +855,7 @@ fn file_metrics(
     // Check cache before opening any handles — a hit skips CreateFileW,
     // read_identity, and GetCompressedFileSizeW. ADS is always queried fresh
     // because NTFS does not update LastWriteTime when streams change.
-    if let Some((cached_alloc, cached_ids)) =
-        context.cache().get_attributes(path, info.len, mtime)
+    if let Some((cached_alloc, cached_ids)) = context.cache().get_attributes(path, info.len, mtime)
     {
         let ads = collect_ads(path).unwrap_or_default();
         logical += ads.total_bytes;
@@ -907,13 +912,9 @@ fn file_metrics(
 
     // Avoid caching a synthetic zero when allocation lookup fails.
     if allocated_complete {
-        context.cache().insert_attributes(
-            path.to_path_buf(),
-            mtime,
-            info.len,
-            alloc_size,
-            ids,
-        );
+        context
+            .cache()
+            .insert_attributes(path.to_path_buf(), mtime, info.len, alloc_size, ids);
     }
 
     Ok((logical, Some(alloc_size), allocated_complete, ids, ads))
@@ -1068,12 +1069,9 @@ fn collect_ads_via_handle(handle: HANDLE) -> Result<AdsSummary> {
             break;
         }
         let base = offset;
-        let next =
-            u32::from_le_bytes(buf[base..base + 4].try_into().unwrap()) as usize;
-        let name_len =
-            u32::from_le_bytes(buf[base + 4..base + 8].try_into().unwrap()) as usize;
-        let stream_size =
-            i64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap());
+        let next = u32::from_le_bytes(buf[base..base + 4].try_into().unwrap()) as usize;
+        let name_len = u32::from_le_bytes(buf[base + 4..base + 8].try_into().unwrap()) as usize;
+        let stream_size = i64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap());
         let name_start = base + FILE_STREAM_INFO_HEADER;
 
         if name_start + name_len <= buf.len() {
