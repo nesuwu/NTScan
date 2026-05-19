@@ -1,19 +1,28 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::ffi::c_void;
-use std::fs::{self, Metadata};
+use std::fs;
 use std::io;
-use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use rayon::prelude::*;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_SHARING_VIOLATION, HANDLE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_HANDLE_EOF, ERROR_NO_MORE_FILES,
+    ERROR_SHARING_VIOLATION, FILETIME, HANDLE,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_STANDARD_INFO, FileStandardInfo, FindClose,
-    FindFirstStreamW, FindNextStreamW, GetCompressedFileSizeW, GetFileInformationByHandleEx,
-    STREAM_INFO_LEVELS, WIN32_FIND_STREAM_DATA,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FIND_FIRST_EX_LARGE_FETCH, FileStandardInfo, FindClose, FindExInfoBasic,
+    FindExSearchNameMatch, FindFirstFileExW, FindFirstStreamW, FindNextFileW, FindNextStreamW,
+    GetCompressedFileSizeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    OPEN_EXISTING, STREAM_INFO_LEVELS, WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
 };
 use windows::core::{HRESULT, PCWSTR};
 
@@ -25,11 +34,54 @@ use crate::model::{
 
 const CANCEL_CHECK_INTERVAL: usize = 64;
 
+/// Minimum file count before rayon parallel dispatch kicks in.
+/// Below this threshold the sequential path avoids dispatch overhead.
+///
+/// Lowered from 128 → 32 (Change 6): with the single-handle file path
+/// (Change 2) each file now does meaningfully more kernel work, so the
+/// break-even point where parallel dispatch pays for itself drops. A
+/// 32-file directory of mixed content already amortises the rayon
+/// fork/join overhead.
+const FILE_PARALLEL_THRESHOLD: usize = 32;
+
 #[cfg(test)]
 static FORCE_ALLOCATED_SIZE_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static FORCE_ALLOCATED_SIZE_FAILURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// ── Change 5: ADS enumeration on an already-open handle ─────────────────
+//
+// `FindFirstStreamW`/`FindNextStreamW` re-open the file by path internally.
+// `NtQueryInformationFile(FileStreamInformation)` lets us enumerate streams
+// through the handle we already opened for the allocation-size + identity
+// query, removing one path-based open per file.
+
+#[repr(C)]
+struct IoStatusBlock {
+    status: usize,
+    information: usize,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationFile(
+        file_handle: HANDLE,
+        io_status_block: *mut IoStatusBlock,
+        file_information: *mut c_void,
+        length: u32,
+        file_information_class: i32,
+    ) -> i32;
+}
+
+/// `FILE_INFORMATION_CLASS::FileStreamInformation`.
+const FILE_STREAM_INFORMATION: i32 = 22;
+const STATUS_BUFFER_OVERFLOW: u32 = 0x8000_0005;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+/// Header is `NextEntryOffset:u32 + StreamNameLength:u32 + StreamSize:i64 +
+/// StreamAllocationSize:i64`, then `StreamName` WCHARs.
+const FILE_STREAM_INFO_HEADER: usize = 24;
 
 #[derive(Debug)]
 struct ScanCancelled;
@@ -62,13 +114,13 @@ pub fn is_scan_cancelled(err: &anyhow::Error) -> bool {
 /// Scans a single directory, aggregating its total size and collecting children.
 ///
 /// This function performs the following steps:
-/// 1. **Metadata Retrieval**: Fetches basic metadata (mtime, attributes) for the directory.
-/// 2. **Plan Preparation**: Enumerates entries and splits them into sub-directories and files.
-///    See [`prepare_directory_plan`] for details.
-/// 3. **Parallel Execution**: Processes sub-directories in parallel using `rayon`, recursively
-///    calling `scan_directory`.
-/// 4. **Aggregation**: Sums up the results from all children and local files to produce
-///    a final `DirectoryReport`.
+/// 1. **Metadata Retrieval**: Fetches basic metadata (mtime) for the directory.
+/// 2. **Early dispatch traversal**: Enumerates entries via `FindFirstFileExW`
+///    and, the moment a sub-directory is discovered, hands it to a rayon
+///    worker (Change 1) instead of waiting for the whole directory to be
+///    classified first.
+/// 3. **Aggregation**: Sums the results from all children and local files to
+///    produce a final `DirectoryReport`.
 pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     let result = scan_directory_inner(path, context);
     if let Err(err) = &result
@@ -81,36 +133,58 @@ pub fn scan_directory(path: &Path, context: &ScanContext) -> Result<DirectoryRep
 
 fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryReport> {
     check_cancelled(context)?;
-    context.emit(ProgressEvent::Started(path.to_path_buf()));
+    // Change 7: only pay the PathBuf clone when someone is listening.
+    if context.has_progress() {
+        context.emit(ProgressEvent::Started(path.to_path_buf()));
+    }
 
     let metadata = fs::metadata(path)
         .with_context(|| format!("metadata access failed for {}", path.display()))?;
     let mtime = metadata.modified().ok();
 
-    let plan = prepare_directory_plan(path, context)?;
+    // Change 1: dispatch sub-directories the instant they are found, rather
+    // than draining the whole directory into a Vec first. Child results flow
+    // back over an mpsc channel so the classify loop never blocks on them.
+    let (tx, rx) = mpsc::channel::<Result<EntryReport>>();
+    let mut pending_files: Vec<PendingFile> = Vec::new();
+    let mut precomputed: Vec<EntryReport> = Vec::new();
 
-    let DirectoryPlan {
-        directories,
-        mut precomputed_entries,
-        file_logical,
-        file_allocated,
-        file_allocated_complete,
-    } = plan;
+    rayon::scope(|s| -> Result<()> {
+        let iter = WinDirIter::new(path)?;
+        for (index, raw) in iter.enumerate() {
+            if index % CANCEL_CHECK_INTERVAL == 0 {
+                check_cancelled(context)?;
+            }
+            let raw = raw?;
+            match classify(raw, path, context) {
+                Classified::Dir(job) => {
+                    let tx = tx.clone();
+                    s.spawn(move |_| {
+                        let _ = tx.send(process_directory_child(job, context));
+                    });
+                }
+                Classified::File(pending) => pending_files.push(pending),
+                Classified::Pre(entry) => precomputed.push(entry),
+            }
+        }
+        Ok(())
+    })?;
+    drop(tx);
 
-    let mut dir_entries: Vec<EntryReport> = directories
-        .into_par_iter()
-        .try_fold(Vec::new, |mut acc, job| -> Result<Vec<EntryReport>> {
-            check_cancelled(context)?;
-            acc.push(process_directory_child(job, context)?);
-            Ok(acc)
-        })
-        .try_reduce(
-            Vec::new,
-            |mut left, mut right| -> Result<Vec<EntryReport>> {
-                left.append(&mut right);
-                Ok(left)
-            },
-        )?;
+    let initial_allocated = match context.options().mode {
+        ScanMode::Fast => None,
+        ScanMode::Accurate => Some(0u64),
+    };
+    let (file_logical, file_allocated, file_allocated_complete, file_entries) =
+        process_pending_files(&pending_files, initial_allocated, context)?;
+    precomputed.extend(file_entries);
+
+    let mut dir_entries: Vec<EntryReport> = Vec::new();
+    for item in rx {
+        // `process_directory_child` only returns Err on cancellation; any
+        // other failure becomes an error entry. Propagate cancellation.
+        dir_entries.push(item?);
+    }
 
     let directories_logical: u64 = dir_entries.iter().map(|entry| entry.logical_size).sum();
     let total_logical = file_logical + directories_logical;
@@ -144,8 +218,8 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         }
     }
 
-    precomputed_entries.append(&mut dir_entries);
-    let mut entries = precomputed_entries;
+    precomputed.append(&mut dir_entries);
+    let mut entries = precomputed;
 
     for entry in &mut entries {
         entry.percent_of_parent = if total_logical == 0 {
@@ -169,12 +243,24 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
         entries,
     };
 
-    context.emit(ProgressEvent::Completed {
-        path: path.to_path_buf(),
-        logical: report.logical_size,
-        allocated: report.allocated_size,
-        allocated_complete: report.allocated_complete,
-    });
+    if context.has_progress() {
+        context.emit(ProgressEvent::Completed {
+            path: path.to_path_buf(),
+            logical: report.logical_size,
+            allocated: report.allocated_size,
+            allocated_complete: report.allocated_complete,
+        });
+    }
+
+    // Persist this directory's totals so future scans can skip the subtree walk
+    // when the mtime hasn't changed.
+    context.dir_cache().insert(
+        path,
+        mtime,
+        report.logical_size,
+        report.allocated_size,
+        report.allocated_complete,
+    );
 
     Ok(report)
 }
@@ -182,19 +268,12 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
 /// Reads a directory and segregates entries into sub-directories (for parallel
 /// scanning) and files/other (for immediate summation).
 ///
-/// The function runs in two phases:
-///
-/// 1. **Classification** (sequential) — iterates `read_dir` once, performing only
-///    lightweight metadata checks.  Directories are queued for later parallel
-///    recursion; files are collected with their resolved `Metadata` for Phase 2;
-///    errors and skipped entries are emitted immediately.
-///
-/// 2. **File processing** (parallel above [`FILE_PARALLEL_THRESHOLD`]) — the
-///    expensive per-file work (allocation size, ADS enumeration, hard-link dedup)
-///    runs in parallel via rayon when the file count justifies the dispatch
-///    overhead.  This removes the bottleneck that previously serialised all file
-///    work when a single directory contains many thousands of entries (e.g. a
-///    Downloads or temp folder).
+/// This is the non-early-dispatch variant kept for the TUI driver in
+/// `modes.rs`, which dispatches the returned `directories` itself. It shares
+/// [`classify`] and [`WinDirIter`] with [`scan_directory_inner`] so the
+/// per-entry semantics stay identical, then runs the deferred per-file work
+/// (allocation size, ADS, hard-link dedup) in parallel above
+/// [`FILE_PARALLEL_THRESHOLD`].
 pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<DirectoryPlan> {
     check_cancelled(context)?;
 
@@ -202,112 +281,22 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     let mut precomputed_entries = Vec::new();
     let mut pending_files: Vec<PendingFile> = Vec::new();
 
-    let read_dir = fs::read_dir(path)
-        .with_context(|| format!("failed to read directory {}", path.display()))?;
-
-    // ── Phase 1: classify entries (sequential) ──────────────────────────
-    for (index, entry) in read_dir.enumerate() {
+    let iter = WinDirIter::new(path)?;
+    for (index, raw) in iter.enumerate() {
         if index % CANCEL_CHECK_INTERVAL == 0 {
             check_cancelled(context)?;
         }
-
-        let entry = entry.with_context(|| format!("failed to iterate {}", path.display()))?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let entry_path = entry.path();
-
-        // Use symlink metadata so reparse points (symlinks/junctions) stay visible.
-        let symlink_metadata = match fs::symlink_metadata(&entry_path) {
-            Ok(meta) => meta,
-            Err(err) => {
-                context.record_error(classify_io_error(&err));
-                context.emit(ProgressEvent::EntryError {
-                    path: entry_path.clone(),
-                    message: format!("metadata error: {}", err),
-                });
-                precomputed_entries.push(entry_with_error(
-                    name,
-                    entry_path.clone(),
-                    EntryKind::Other,
-                    format!("metadata error: {}", err),
-                ));
-                continue;
+        let raw = raw?;
+        match classify(raw, path, context) {
+            Classified::Dir(job) => {
+                check_cancelled(context)?;
+                directories.push(job);
             }
-        };
-
-        let is_reparse_point = is_reparse_point(&symlink_metadata);
-        let is_symlink = symlink_metadata.file_type().is_symlink() || is_reparse_point;
-
-        let target_metadata: Option<Metadata> = if is_symlink {
-            if !context.options().follow_symlinks {
-                context.record_skipped();
-                context.emit(ProgressEvent::Skipped(
-                    entry_path.clone(),
-                    String::from("symlink not followed (use --follow-symlinks)"),
-                ));
-                precomputed_entries.push(entry_with_skip(
-                    name,
-                    entry_path.clone(),
-                    EntryKind::Skipped,
-                    "symlink not followed (use --follow-symlinks)",
-                ));
-                continue;
-            }
-            match fs::metadata(&entry_path) {
-                Ok(meta) => Some(meta),
-                Err(err) => {
-                    context.record_error(classify_io_error(&err));
-                    context.emit(ProgressEvent::EntryError {
-                        path: entry_path.clone(),
-                        message: format!("symlink target metadata failed: {}", err),
-                    });
-                    precomputed_entries.push(entry_with_error(
-                        name,
-                        entry_path.clone(),
-                        EntryKind::Other,
-                        format!("symlink target metadata failed: {}", err),
-                    ));
-                    continue;
-                }
-            }
-        } else {
-            Some(symlink_metadata)
-        };
-
-        let meta = match target_metadata {
-            Some(m) => m,
-            None => continue,
-        };
-
-        if meta.is_dir() {
-            check_cancelled(context)?;
-            directories.push(ChildJob {
-                name,
-                path: entry_path,
-                was_symlink: is_symlink,
-            });
-            continue;
+            Classified::File(pending) => pending_files.push(pending),
+            Classified::Pre(entry) => precomputed_entries.push(entry),
         }
-
-        if meta.is_file() {
-            // Defer the expensive per-file work to Phase 2.
-            pending_files.push(PendingFile {
-                name,
-                path: entry_path,
-                meta,
-            });
-            continue;
-        }
-
-        precomputed_entries.push(entry_with_error(
-            name,
-            entry_path.clone(),
-            EntryKind::Other,
-            "unsupported entry type",
-        ));
-        context.record_error(ScanErrorKind::Other);
     }
 
-    // ── Phase 2: process files (parallel for large directories) ─────────
     let initial_allocated = match context.options().mode {
         ScanMode::Fast => None,
         ScanMode::Accurate => Some(0u64),
@@ -326,12 +315,238 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     })
 }
 
-/// Lightweight pre-classified file info collected during Phase 1.
+// ── Directory enumeration (Change 3 + Change 4) ─────────────────────────
+
+thread_local! {
+    /// Reused per-thread UTF-16 scratch buffer (Change 4). Avoids a fresh
+    /// `Vec<u16>` allocation for every `GetCompressedFileSizeW` /
+    /// `FindFirstFileExW` call on the hot path.
+    static WIDE_BUF: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with a NUL-terminated wide encoding of `path` in the thread-local
+/// scratch buffer. The pointer is valid only for the duration of `f`; `f` must
+/// not call another `with_wide_*` helper (the `RefCell` is held).
+fn with_wide_path<R>(path: &Path, f: impl FnOnce(*const u16) -> R) -> R {
+    WIDE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.extend(path.as_os_str().encode_wide());
+        buf.push(0);
+        f(buf.as_ptr())
+    })
+}
+
+/// Like [`with_wide_path`] but appends a `\*` search glob for
+/// `FindFirstFileExW`.
+fn with_wide_search<R>(dir: &Path, f: impl FnOnce(*const u16) -> R) -> R {
+    WIDE_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.extend(dir.as_os_str().encode_wide());
+        let sep = matches!(buf.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/'));
+        if !sep {
+            buf.push(u16::from(b'\\'));
+        }
+        buf.push(u16::from(b'*'));
+        buf.push(0);
+        f(buf.as_ptr())
+    })
+}
+
+/// One raw directory entry as returned by `FindFirstFileExW`/`FindNextFileW`,
+/// already carrying the attributes, size and mtime so no per-entry `stat`
+/// round-trip is needed (Change 3).
+struct RawEntry {
+    name: String,
+    attributes: u32,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Size + mtime of a classified file, carried into Phase 2 in place of a
+/// `std::fs::Metadata` (which would have cost a second `stat`).
+struct EntryInfo {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// Directory iterator using `FindFirstFileExW` with `FindExInfoBasic`
+/// (skip the 8.3 short-name lookup) and `FIND_FIRST_EX_LARGE_FETCH`
+/// (batch more entries per kernel transition) — Change 3.
+struct WinDirIter {
+    handle: HANDLE,
+    data: WIN32_FIND_DATAW,
+    first: bool,
+    done: bool,
+}
+
+impl WinDirIter {
+    fn new(dir: &Path) -> Result<Self> {
+        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+        let handle = with_wide_search(dir, |pattern| unsafe {
+            FindFirstFileExW(
+                PCWSTR(pattern),
+                FindExInfoBasic,
+                &mut data as *mut _ as *mut c_void,
+                FindExSearchNameMatch,
+                None,
+                FIND_FIRST_EX_LARGE_FETCH,
+            )
+        })
+        .with_context(|| format!("failed to read directory {}", dir.display()))?;
+
+        Ok(Self {
+            handle,
+            data,
+            first: true,
+            done: false,
+        })
+    }
+}
+
+impl Iterator for WinDirIter {
+    type Item = Result<RawEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if self.first {
+                self.first = false;
+            } else {
+                match unsafe { FindNextFileW(self.handle, &mut self.data) } {
+                    Ok(()) => {}
+                    Err(err) => {
+                        self.done = true;
+                        if err.code() == hresult_from_win32(ERROR_NO_MORE_FILES.0) {
+                            return None;
+                        }
+                        return Some(Err(anyhow!("FindNextFileW failed: {}", err)));
+                    }
+                }
+            }
+
+            let name = wide_name(&self.data.cFileName);
+            if name == "." || name == ".." {
+                continue;
+            }
+            let len =
+                ((self.data.nFileSizeHigh as u64) << 32) | (self.data.nFileSizeLow as u64);
+            return Some(Ok(RawEntry {
+                name,
+                attributes: self.data.dwFileAttributes,
+                len,
+                modified: filetime_to_systemtime(self.data.ftLastWriteTime),
+            }));
+        }
+    }
+}
+
+impl Drop for WinDirIter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FindClose(self.handle);
+        }
+    }
+}
+
+fn wide_name(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn filetime_to_systemtime(ft: FILETIME) -> Option<SystemTime> {
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+    if ticks == 0 {
+        return None;
+    }
+    // 100ns ticks since 1601-01-01; offset to the Unix epoch.
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+    let secs_since_1601 = ticks / 10_000_000;
+    if secs_since_1601 < EPOCH_DIFF_SECS {
+        return None;
+    }
+    let nanos = ((ticks % 10_000_000) * 100) as u32;
+    Some(UNIX_EPOCH + Duration::new(secs_since_1601 - EPOCH_DIFF_SECS, nanos))
+}
+
+/// Outcome of classifying one raw directory entry.
+enum Classified {
+    Dir(ChildJob),
+    File(PendingFile),
+    /// A finished entry (error/skip) to surface in the report as-is.
+    Pre(EntryReport),
+}
+
+/// Replicates the original Phase-1 classification: reparse points obey the
+/// `--follow-symlinks` policy (skip or resolve the target), directories become
+/// jobs, everything else becomes a deferred file.
+fn classify(raw: RawEntry, parent: &Path, context: &ScanContext) -> Classified {
+    let path = parent.join(&raw.name);
+    let is_symlink = (raw.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
+
+    let (len, modified, is_dir) = if is_symlink {
+        if !context.options().follow_symlinks {
+            context.record_skipped();
+            if context.has_progress() {
+                context.emit(ProgressEvent::Skipped(
+                    path.clone(),
+                    String::from("symlink not followed (use --follow-symlinks)"),
+                ));
+            }
+            return Classified::Pre(entry_with_skip(
+                raw.name,
+                path,
+                EntryKind::Skipped,
+                "symlink not followed (use --follow-symlinks)",
+            ));
+        }
+        match fs::metadata(&path) {
+            Ok(meta) => (meta.len(), meta.modified().ok(), meta.is_dir()),
+            Err(err) => {
+                context.record_error(classify_io_error(&err));
+                if context.has_progress() {
+                    context.emit(ProgressEvent::EntryError {
+                        path: path.clone(),
+                        message: format!("symlink target metadata failed: {}", err),
+                    });
+                }
+                return Classified::Pre(entry_with_error(
+                    raw.name,
+                    path,
+                    EntryKind::Other,
+                    format!("symlink target metadata failed: {}", err),
+                ));
+            }
+        }
+    } else {
+        let is_dir = (raw.attributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+        (raw.len, raw.modified, is_dir)
+    };
+
+    if is_dir {
+        return Classified::Dir(ChildJob {
+            name: raw.name,
+            path,
+            was_symlink: is_symlink,
+        });
+    }
+
+    Classified::File(PendingFile {
+        name: raw.name,
+        path,
+        info: EntryInfo { len, modified },
+    })
+}
+
+/// Lightweight pre-classified file info collected during classification.
 /// The expensive work (allocation, ADS, dedup) is deferred to Phase 2.
 struct PendingFile {
     name: String,
     path: PathBuf,
-    meta: Metadata,
+    info: EntryInfo,
 }
 
 /// Per-file result produced by [`process_single_file`].
@@ -343,10 +558,6 @@ struct FileResult {
     allocated_complete: bool,
     entry: Option<EntryReport>,
 }
-
-/// Minimum file count before rayon parallel dispatch kicks in.
-/// Below this threshold the sequential path avoids dispatch overhead.
-const FILE_PARALLEL_THRESHOLD: usize = 128;
 
 /// Processes a batch of files, switching between sequential and parallel
 /// execution depending on count.
@@ -403,10 +614,16 @@ fn process_pending_files(
 fn process_single_file(file: &PendingFile, context: &ScanContext) -> Result<FileResult> {
     check_cancelled(context)?;
 
-    let (logical, allocated, allocated_complete) =
-        accumulate_file_sizes(&file.path, &file.meta, context)?;
+    let (logical, allocated, allocated_complete, ids, ads) =
+        file_metrics(&file.path, &file.info, context)?;
 
-    let (is_first_logical, is_first_alloc) = context.mark_file_unique(&file.path);
+    // Change 2: in Accurate mode the identity was already read from the one
+    // handle file_metrics opened, so dedup needs no extra CreateFileW.
+    let (is_first_logical, is_first_alloc) = if context.options().mode == ScanMode::Accurate {
+        context.mark_file_unique_by_id(ids, &file.path)
+    } else {
+        context.mark_file_unique(&file.path)
+    };
 
     let accounted_logical = if is_first_logical { logical } else { 0 };
 
@@ -418,11 +635,7 @@ fn process_single_file(file: &PendingFile, context: &ScanContext) -> Result<File
 
     let entry = if context.options().show_files {
         let (ads_bytes, ads_count) = if context.options().mode == ScanMode::Accurate {
-            context
-                .cache()
-                .get_attributes(&file.path, file.meta.len(), file.meta.modified().ok())
-                .map(|(_, bytes, count)| (bytes, count))
-                .unwrap_or((0, 0))
+            (ads.total_bytes, ads.count)
         } else {
             (0, 0)
         };
@@ -447,7 +660,7 @@ fn process_single_file(file: &PendingFile, context: &ScanContext) -> Result<File
             ads_count,
             error: None,
             skip_reason: None,
-            modified: file.meta.modified().ok(),
+            modified: file.info.modified,
         })
     } else {
         None
@@ -471,10 +684,12 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
         && !context.mark_if_new(canon)
     {
         context.record_skipped();
-        context.emit(ProgressEvent::Skipped(
-            job.path.clone(),
-            String::from("cycle detected"),
-        ));
+        if context.has_progress() {
+            context.emit(ProgressEvent::Skipped(
+                job.path.clone(),
+                String::from("cycle detected"),
+            ));
+        }
         return Ok(entry_with_skip(
             job.name,
             job.path,
@@ -484,6 +699,35 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
     }
 
     check_cancelled(context)?;
+
+    // Directory-level cache: check before starting a full subtree walk. Only
+    // applied here (not in scan_directory_inner) so that direct scan_directory
+    // callers (tests, CLI) always get fully-populated entries.
+    let dir_mtime = fs::metadata(&job.path).ok().and_then(|m| m.modified().ok());
+    if let Some(cached) = context.dir_cache().get(&job.path, dir_mtime, context.options().mode) {
+        if context.has_progress() {
+            context.emit(ProgressEvent::CacheHit(job.path.clone()));
+        }
+        return Ok(EntryReport {
+            name: job.name,
+            path: job.path,
+            kind: if job.was_symlink {
+                EntryKind::SymlinkDirectory
+            } else {
+                EntryKind::Directory
+            },
+            logical_size: cached.logical_size,
+            allocated_size: cached.allocated_size,
+            allocated_complete: cached.allocated_complete,
+            percent_of_parent: 0.0,
+            ads_bytes: 0,
+            ads_count: 0,
+            error: None,
+            skip_reason: None,
+            modified: dir_mtime,
+        });
+    }
+
     match scan_directory(&job.path, context) {
         Ok(report) => Ok(EntryReport {
             name: job.name,
@@ -505,10 +749,12 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
         }),
         Err(err) if is_scan_cancelled(&err) => Err(err),
         Err(err) => {
-            context.emit(ProgressEvent::EntryError {
-                path: job.path.clone(),
-                message: format!("directory scan failed: {}", err),
-            });
+            if context.has_progress() {
+                context.emit(ProgressEvent::EntryError {
+                    path: job.path.clone(),
+                    message: format!("directory scan failed: {}", err),
+                });
+            }
             Ok(entry_with_error(
                 job.name,
                 job.path,
@@ -523,81 +769,157 @@ pub fn process_directory_child(job: ChildJob, context: &ScanContext) -> Result<E
     }
 }
 
-fn accumulate_file_sizes(
+// ── Change 2: one handle per file in Accurate mode ──────────────────────
+
+/// RAII wrapper closing a `CreateFileW` handle on drop.
+struct FileHandleGuard(HANDLE);
+
+impl Drop for FileHandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Opens a query-only handle (0 access rights, so locked/system files still
+/// open) with reparse semantics, matching `context::file_identity`.
+fn open_query_handle(path: &Path) -> Option<HANDLE> {
+    // CreateFileW handles absolute paths fine; only paths beyond MAX_PATH
+    // need the \\?\ prefix.
+    let needs_long_prefix =
+        path.as_os_str().len() > 248 && !path.to_string_lossy().starts_with("\\\\?\\");
+    let wide: Vec<u16> = if needs_long_prefix {
+        let mut prefixed = std::ffi::OsString::from("\\\\?\\");
+        prefixed.push(path.as_os_str());
+        let mut w: Vec<u16> = prefixed.encode_wide().collect();
+        w.push(0);
+        w
+    } else {
+        let mut w: Vec<u16> = path.as_os_str().encode_wide().collect();
+        w.push(0);
+        w
+    };
+
+    unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            HANDLE(0),
+        )
+        .ok()
+    }
+}
+
+/// Reads `(dwVolumeSerialNumber, 64-bit file index)` from an open handle.
+fn read_identity(handle: HANDLE) -> Option<(u64, u64)> {
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle, &mut info) }.is_ok() {
+        let idx = ((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64);
+        Some((info.dwVolumeSerialNumber as u64, idx))
+    } else {
+        None
+    }
+}
+
+/// Computes logical size, allocation size, hard-link identity and ADS for a
+/// file. In Accurate mode this opens **one** handle and reuses it for the
+/// identity read, ADS enumeration and (on `GetCompressedFileSizeW` failure)
+/// the allocation-size fallback — Change 2 + Change 5.
+fn file_metrics(
     path: &Path,
-    meta: &Metadata,
+    info: &EntryInfo,
     context: &ScanContext,
-) -> Result<(u64, Option<u64>, bool)> {
+) -> Result<(u64, Option<u64>, bool, Option<(u64, u64)>, AdsSummary)> {
     check_cancelled(context)?;
-    let mut logical = meta.len();
-    let mut allocated = None;
-    let mut allocated_complete = true;
 
     if context.options().mode == ScanMode::Fast {
-        return Ok((logical, None, false));
+        return Ok((info.len, None, false, None, AdsSummary::default()));
     }
 
-    if context.options().mode == ScanMode::Accurate {
-        check_cancelled(context)?;
-        let mtime = meta.modified().ok();
+    // Accurate mode.
+    check_cancelled(context)?;
+    let mtime = info.modified;
+    let mut logical = info.len;
 
-        if let Some((cached_alloc, cached_ads_bytes, _)) =
-            context.cache().get_attributes(path, logical, mtime)
-        {
-            logical += cached_ads_bytes;
-            allocated = Some(cached_alloc);
-            return Ok((logical, allocated, allocated_complete));
-        }
+    // Check cache before opening any handles — a hit skips CreateFileW,
+    // read_identity, and GetCompressedFileSizeW. ADS is always queried fresh
+    // because NTFS does not update LastWriteTime when streams change.
+    if let Some((cached_alloc, cached_ids)) =
+        context.cache().get_attributes(path, info.len, mtime)
+    {
+        let ads = collect_ads(path).unwrap_or_default();
+        logical += ads.total_bytes;
+        return Ok((logical, Some(cached_alloc), true, cached_ids, ads));
+    }
 
-        check_cancelled(context)?;
-        let mut ads_summary = AdsSummary::default();
-        match collect_ads(path) {
+    let handle = open_query_handle(path);
+    let _guard = handle.map(FileHandleGuard);
+    let ids = handle.and_then(read_identity);
+
+    check_cancelled(context)?;
+    let ads = {
+        let res = match handle {
+            // Prefer the handle-based stream query; fall back to the legacy
+            // path-based FindFirstStreamW if the NT call is unavailable.
+            Some(h) => collect_ads_via_handle(h).or_else(|_| collect_ads(path)),
+            None => collect_ads(path),
+        };
+        match res {
             Ok(ads) => {
                 logical += ads.total_bytes;
-                ads_summary = ads;
+                ads
             }
             Err(err) => {
                 context.record_error(ScanErrorKind::ADSFailed);
-                context.emit(ProgressEvent::EntryError {
-                    path: path.to_path_buf(),
-                    message: format!("ADS enumeration failed: {}", err),
-                });
+                if context.has_progress() {
+                    context.emit(ProgressEvent::EntryError {
+                        path: path.to_path_buf(),
+                        message: format!("ADS enumeration failed: {}", err),
+                    });
+                }
+                AdsSummary::default()
             }
         }
+    };
 
-        check_cancelled(context)?;
-        let alloc_size = match get_allocated_size_fast(path) {
-            Ok(size) => size,
-            Err(err) => {
-                let kind = classify_anyhow_error(&err);
-                context.record_error(kind);
+    check_cancelled(context)?;
+    let mut allocated_complete = true;
+    let alloc_size = match get_allocated_size_fast(path, handle) {
+        Ok(size) => size,
+        Err(err) => {
+            let kind = classify_anyhow_error(&err);
+            context.record_error(kind);
+            if context.has_progress() {
                 context.emit(ProgressEvent::EntryError {
                     path: path.to_path_buf(),
                     message: format!("allocation size failed: {}", err),
                 });
-                allocated_complete = false;
-                0
             }
-        };
-        allocated = Some(alloc_size);
-
-        // Avoid caching a synthetic zero when allocation lookup fails.
-        if allocated_complete {
-            context.cache().insert_attributes(
-                path.to_path_buf(),
-                mtime,
-                meta.len(),
-                alloc_size,
-                ads_summary.total_bytes,
-                ads_summary.count,
-            );
+            allocated_complete = false;
+            0
         }
+    };
+
+    // Avoid caching a synthetic zero when allocation lookup fails.
+    if allocated_complete {
+        context.cache().insert_attributes(
+            path.to_path_buf(),
+            mtime,
+            info.len,
+            alloc_size,
+            ids,
+        );
     }
 
-    Ok((logical, allocated, allocated_complete))
+    Ok((logical, Some(alloc_size), allocated_complete, ids, ads))
 }
 
-fn get_allocated_size_fast(path: &Path) -> Result<u64> {
+fn get_allocated_size_fast(path: &Path, handle: Option<HANDLE>) -> Result<u64> {
     #[cfg(test)]
     if FORCE_ALLOCATED_SIZE_FAILURE.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(anyhow!(
@@ -606,19 +928,37 @@ fn get_allocated_size_fast(path: &Path) -> Result<u64> {
         ));
     }
 
-    let wide = path_to_wide(path);
-    unsafe {
+    let (low, high) = with_wide_path(path, |p| unsafe {
         let mut high: u32 = 0;
-        let low = GetCompressedFileSizeW(PCWSTR(wide.as_ptr()), Some(&mut high as *mut u32));
-        if low == u32::MAX {
-            use windows::Win32::Foundation::GetLastError;
-            let err = GetLastError();
-            if err.is_err() {
-                return get_allocated_size(path);
-            }
+        let low = GetCompressedFileSizeW(PCWSTR(p), Some(&mut high as *mut u32));
+        (low, high)
+    });
+
+    if low == u32::MAX {
+        use windows::Win32::Foundation::GetLastError;
+        let err = unsafe { GetLastError() };
+        if err.is_err() {
+            // Reuse the already-open handle instead of opening a new one.
+            return match handle {
+                Some(h) => get_allocated_size_via_handle(h),
+                None => get_allocated_size(path),
+            };
         }
-        Ok(((high as u64) << 32) | (low as u64))
     }
+    Ok(((high as u64) << 32) | (low as u64))
+}
+
+fn get_allocated_size_via_handle(handle: HANDLE) -> Result<u64> {
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )?;
+    }
+    Ok(info.AllocationSize as u64)
 }
 
 fn entry_with_error(
@@ -665,6 +1005,8 @@ fn entry_with_skip(
     }
 }
 
+/// Last-resort allocation size: opens its own handle. Only reached when no
+/// shared handle was available and `GetCompressedFileSizeW` failed.
 fn get_allocated_size(path: &Path) -> Result<u64> {
     let file = fs::File::open(path)?;
     let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
@@ -677,6 +1019,85 @@ fn get_allocated_size(path: &Path) -> Result<u64> {
         )?;
     }
     Ok(info.AllocationSize as u64)
+}
+
+/// Enumerates alternate data streams through an already-open handle using
+/// `NtQueryInformationFile(FileStreamInformation)` (Change 5).
+fn collect_ads_via_handle(handle: HANDLE) -> Result<AdsSummary> {
+    let mut buf: Vec<u8> = vec![0u8; 4096];
+
+    loop {
+        let mut iosb = IoStatusBlock {
+            status: 0,
+            information: 0,
+        };
+        let status = unsafe {
+            NtQueryInformationFile(
+                handle,
+                &mut iosb,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                FILE_STREAM_INFORMATION,
+            )
+        };
+        if status == 0 {
+            break;
+        }
+        let code = status as u32;
+        if code == STATUS_BUFFER_OVERFLOW
+            || code == STATUS_BUFFER_TOO_SMALL
+            || code == STATUS_INFO_LENGTH_MISMATCH
+        {
+            if buf.len() >= 1 << 20 {
+                return Err(anyhow!("stream info exceeded 1 MiB"));
+            }
+            let new_len = buf.len() * 2;
+            buf.resize(new_len, 0);
+            continue;
+        }
+        return Err(anyhow!(
+            "NtQueryInformationFile(FileStreamInformation) failed: {:#010x}",
+            code
+        ));
+    }
+
+    let mut summary = AdsSummary::default();
+    let mut offset = 0usize;
+    loop {
+        if offset + FILE_STREAM_INFO_HEADER > buf.len() {
+            break;
+        }
+        let base = offset;
+        let next =
+            u32::from_le_bytes(buf[base..base + 4].try_into().unwrap()) as usize;
+        let name_len =
+            u32::from_le_bytes(buf[base + 4..base + 8].try_into().unwrap()) as usize;
+        let stream_size =
+            i64::from_le_bytes(buf[base + 8..base + 16].try_into().unwrap());
+        let name_start = base + FILE_STREAM_INFO_HEADER;
+
+        if name_start + name_len <= buf.len() {
+            let wide: Vec<u16> = buf[name_start..name_start + name_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let name = String::from_utf16_lossy(&wide);
+            if name != "::$DATA" && stream_size > 0 {
+                summary.total_bytes += stream_size as u64;
+                summary.count += 1;
+            }
+        }
+
+        if next == 0 {
+            break;
+        }
+        offset += next;
+        if offset <= base {
+            break;
+        }
+    }
+
+    Ok(summary)
 }
 
 fn collect_ads(path: &Path) -> Result<AdsSummary> {
@@ -809,17 +1230,6 @@ fn classify_anyhow_error(err: &anyhow::Error) -> ScanErrorKind {
     } else {
         ScanErrorKind::Other
     }
-}
-
-/// Checks if a file/directory is a reparse point (junction, mount point, or symlink).
-///
-/// Rust's `is_symlink()` only detects symbolic links, not NTFS junctions.
-/// Windows system directories like `C:\Documents and Settings` are junctions
-/// pointing to `C:\Users`, and would cause massive double-counting if followed.
-fn is_reparse_point(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    let attrs = metadata.file_attributes();
-    (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0
 }
 
 #[cfg(test)]

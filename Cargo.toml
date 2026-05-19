@@ -1,6 +1,6 @@
 [package]
 name = "ntscan"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 
 [lib]
@@ -19,18 +19,19 @@ num_cpus = "1.16"
 ratatui = { version = "0.27", optional = true }
 rayon = "1.10"
 time = { version = "0.3", features = ["formatting", "macros"] }
+redb = "2"
 sha2 = "0.10"
 trash = { version = "3.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 windows = { version = "0.52.0", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_IO",
-    "Win32_System_Console",
-    "Win32_UI_Shell",
-    "Win32_System_Com",
-    "Win32_Security"
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Console",
+  "Win32_UI_Shell",
+  "Win32_System_Com",
+  "Win32_Security",
 ] }
 
 [dev-dependencies]

@@ -1,15 +1,21 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::fs::{self, File};
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use redb::{Database, ReadableTable, TableDefinition};
+
+use crate::cache::DirScanCache;
 use crate::model::{ErrorStats, ProgressEvent, ScanErrorKind, ScanOptions, SkipStats};
+
+const CACHE_ENV_PATH: &str = "NTSCAN_CACHE_PATH";
+const SCAN_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("scan_attributes_v2");
 
 /// A thread-safe flag to signal cancellation across multiple worker threads.
 ///
@@ -73,48 +79,21 @@ struct CachedAttributes {
     mtime_nanos: u32,
     logical_size: u64,
     allocated_size: u64,
-    ads_bytes: u64,
-    ads_count: u32,
+    // Hardlink identity: (volume_serial, file_id). 0/0 = not cached.
+    vol_serial: u64,
+    file_id: u64,
 }
 
 /// Persisted cache for file attributes to speed up subsequent scans.
 ///
-/// The cache stores `allocated_size` and `ads_stats` for files, keyed by their
-/// normalized (lower-cased) absolute path. This avoids expensive filesystem
-/// operations (like `GetCompressedFileSizeW` and stream enumeration) on unchanged files.
-///
-/// # Implementation Details
-///
-/// * **Sharding**: The cache is partitioned into 256 shards to reduce lock contention
-///   during parallel scanning.
-/// * **Persistence**: Data is saved to a binary file in `%LOCALAPPDATA%` (Windows)
-///   or the temporary directory (other OS).
-/// * **Validation**: Entries are only returned if the file's modification time and
-///   logical size match the cached values.
+/// On construction, **all** entries are read from the redb database into 256
+/// in-memory shards so every scanner thread gets pure-RAM lookups with no disk
+/// I/O during the scan. The database handle is closed after loading and reopened
+/// only on `save()`, avoiding file-lock contention between concurrent instances.
 pub struct ScanCache {
-    /// Key is String (lowercased path) to handle Windows case-insensitivity
     shards: Vec<Mutex<HashMap<String, CachedAttributes>>>,
     dirty: Arc<AtomicBool>,
     file_path: PathBuf,
-    finalizer: Arc<dyn ScanCacheFinalizer>,
-    save_error_logged: AtomicBool,
-}
-
-const CACHE_MAGIC: &[u8; 8] = b"NTSC0003"; // Version 3 (Case Insensitive)
-const CACHE_ENV_PATH: &str = "NTSCAN_CACHE_PATH";
-const MAX_CACHE_ENTRIES: u64 = 2_000_000;
-const MAX_CACHE_PATH_BYTES: usize = 16 * 1024;
-
-trait ScanCacheFinalizer: Send + Sync {
-    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()>;
-}
-
-struct StdScanCacheFinalizer;
-
-impl ScanCacheFinalizer for StdScanCacheFinalizer {
-    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()> {
-        fs::rename(temp_path, final_path)
-    }
 }
 
 impl Default for ScanCache {
@@ -133,54 +112,49 @@ impl Default for ScanCache {
             let mut dir = PathBuf::from(local_app_data);
             dir.push("ntscan");
             if fs::create_dir_all(&dir).is_ok() {
-                return Self::new(dir.join("cache"));
+                return Self::new(dir.join("scan.redb"));
             }
         }
-        Self::new(std::env::temp_dir().join("ntscan.cache"))
+        Self::new(std::env::temp_dir().join("ntscan_scan.redb"))
     }
 }
 
 impl ScanCache {
-    /// Creates a new cache backed by the specified file path.
+    /// Opens the database at `path`, loads all persisted entries into RAM, then
+    /// closes the database handle. Every subsequent lookup is served from the
+    /// in-memory shards with no disk access.
     pub fn new(path: PathBuf) -> Self {
-        let cache = Self::with_finalizer(path, Arc::new(StdScanCacheFinalizer));
-        let _ = cache.load();
-        cache
-    }
+        let shards: Vec<Mutex<HashMap<String, CachedAttributes>>> =
+            (0..256).map(|_| Mutex::new(HashMap::new())).collect();
 
-    fn with_finalizer(path: PathBuf, finalizer: Arc<dyn ScanCacheFinalizer>) -> Self {
-        let num_shards = 256; // Increased for concurrency
-        let mut shards = Vec::with_capacity(num_shards);
-        for _ in 0..num_shards {
-            shards.push(Mutex::new(HashMap::new()));
+        if let Ok(db) = Database::open(&path) {
+            let _ = load_into_shards(&db, &shards);
+            // db handle is dropped here — file lock released until save()
         }
 
         Self {
             shards,
             dirty: Arc::new(AtomicBool::new(false)),
             file_path: path,
-            finalizer,
-            save_error_logged: AtomicBool::new(false),
         }
     }
 
-    #[cfg(test)]
-    fn new_with_finalizer(path: PathBuf, finalizer: Arc<dyn ScanCacheFinalizer>) -> Self {
-        let cache = Self::with_finalizer(path, finalizer);
-        let _ = cache.load();
-        cache
-    }
-
     /// Retrieves cached attributes if the file size and modification time match.
+    ///
+    /// ADS data is intentionally NOT cached — NTFS does not update `LastWriteTime`
+    /// when alternate data streams change, so ADS must always be queried fresh.
+    ///
+    /// Returns `(allocated_size, ids)` where `ids` is `Some((vol_serial, file_id))`
+    /// if the hardlink identity was cached, or `None` if not.
     pub fn get_attributes(
         &self,
         path: &Path,
         current_size: u64,
         current_mtime: Option<SystemTime>,
-    ) -> Option<(u64, u64, usize)> {
+    ) -> Option<(u64, Option<(u64, u64)>)> {
         let (mtime_sec, mtime_nanos) = system_time_to_tuple(current_mtime?);
         let key = normalize_key(path);
-        let idx = self.shard_index(&key);
+        let idx = shard_index(self.shards.len(), &key);
 
         let guard = self.shards[idx].lock().unwrap();
         if let Some(entry) = guard.get(&key)
@@ -188,24 +162,26 @@ impl ScanCache {
             && entry.mtime_sec == mtime_sec
             && entry.mtime_nanos == mtime_nanos
         {
-            return Some((
-                entry.allocated_size,
-                entry.ads_bytes,
-                entry.ads_count as usize,
-            ));
+            let ids = if entry.vol_serial != 0 || entry.file_id != 0 {
+                Some((entry.vol_serial, entry.file_id))
+            } else {
+                None
+            };
+            return Some((entry.allocated_size, ids));
         }
         None
     }
 
     /// Updates or inserts attributes for a given path.
+    ///
+    /// ADS data is deliberately excluded — see [`get_attributes`].
     pub fn insert_attributes(
         &self,
         path: PathBuf,
         mtime: Option<SystemTime>,
         logical: u64,
         allocated: u64,
-        ads_bytes: u64,
-        ads_count: usize,
+        ids: Option<(u64, u64)>,
     ) {
         let (mtime_sec, mtime_nanos) = if let Some(t) = mtime {
             system_time_to_tuple(t)
@@ -213,168 +189,129 @@ impl ScanCache {
             return;
         };
 
+        let (vol_serial, file_id) = ids.unwrap_or((0, 0));
         let entry = CachedAttributes {
             mtime_sec,
             mtime_nanos,
             logical_size: logical,
             allocated_size: allocated,
-            ads_bytes,
-            ads_count: ads_count as u32,
+            vol_serial,
+            file_id,
         };
 
         let key = normalize_key(&path);
-        let idx = self.shard_index(&key);
-        let mut guard = self.shards[idx].lock().unwrap();
-        guard.insert(key, entry);
+        let idx = shard_index(self.shards.len(), &key);
+        self.shards[idx].lock().unwrap().insert(key, entry);
         self.dirty.store(true, AtomicOrdering::Relaxed);
     }
 
-    /// Persists the cache to disk if it has been modified.
+    /// Flushes all in-memory entries to the redb database in one transaction.
     pub fn save(&self) -> io::Result<()> {
         if !self.dirty.load(AtomicOrdering::Relaxed) {
             return Ok(());
         }
 
-        let temp_path = self.file_path.with_extension("tmp");
-        let file = File::create(&temp_path)?;
-        // 8MB Buffer for large writes
-        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-
-        writer.write_all(CACHE_MAGIC)?;
-
-        let mut total_entries = 0usize;
-        for shard in &self.shards {
-            total_entries += shard.lock().unwrap().len();
-        }
-
-        writer.write_all(&(total_entries as u64).to_le_bytes())?;
-
+        let mut snapshot: Vec<(String, CachedAttributes)> = Vec::new();
         for shard in &self.shards {
             let guard = shard.lock().unwrap();
-            for (path_str, attr) in guard.iter() {
-                let path_bytes = path_str.as_bytes();
-
-                if path_bytes.len() > u16::MAX as usize {
-                    continue;
-                }
-
-                writer.write_all(&(path_bytes.len() as u16).to_le_bytes())?;
-                writer.write_all(path_bytes)?;
-
-                writer.write_all(&attr.mtime_sec.to_le_bytes())?;
-                writer.write_all(&attr.mtime_nanos.to_le_bytes())?;
-                writer.write_all(&attr.logical_size.to_le_bytes())?;
-                writer.write_all(&attr.allocated_size.to_le_bytes())?;
-                writer.write_all(&attr.ads_bytes.to_le_bytes())?;
-                writer.write_all(&attr.ads_count.to_le_bytes())?;
-            }
+            snapshot.extend(guard.iter().map(|(k, v)| (k.clone(), *v)));
         }
 
-        writer.flush()?;
-        drop(writer);
-
-        if let Err(err) = self.finalizer.finalize(&temp_path, &self.file_path) {
-            let contextual_err = io::Error::new(
-                err.kind(),
-                format!(
-                    "failed to finalize scan cache save ({} -> {}): {}",
-                    temp_path.display(),
-                    self.file_path.display(),
-                    err
-                ),
-            );
-            if !self.save_error_logged.swap(true, AtomicOrdering::Relaxed) {
-                eprintln!(
-                    "warning: {}. temp cache file left at {}",
-                    contextual_err,
-                    temp_path.display()
-                );
-            }
-            return Err(contextual_err);
-        }
-
-        self.save_error_logged.store(false, AtomicOrdering::Relaxed);
+        let db = open_or_recreate_db(&self.file_path)?;
+        write_snapshot(&db, &snapshot)?;
         self.dirty.store(false, AtomicOrdering::Relaxed);
         Ok(())
     }
+}
 
-    fn load(&self) -> io::Result<()> {
-        if !self.file_path.exists() {
-            return Ok(());
+/// Reads all rows from the redb table into the shard map.
+fn load_into_shards(
+    db: &Database,
+    shards: &[Mutex<HashMap<String, CachedAttributes>>],
+) -> io::Result<()> {
+    let read_txn = match db.begin_read() {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let table = match read_txn.open_table(SCAN_TABLE) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let iter = match table.iter() {
+        Ok(it) => it,
+        Err(_) => return Ok(()),
+    };
+    for result in iter {
+        let (key, value) = match result {
+            Ok(kv) => kv,
+            Err(_) => break,
+        };
+        let path_str = key.value().to_string();
+        let bytes = value.value();
+        if bytes.len() < 44 {
+            continue;
         }
-
-        let file = File::open(&self.file_path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut magic_buf = [0u8; 8];
-        if reader.read_exact(&mut magic_buf).is_err() || &magic_buf != CACHE_MAGIC {
-            return Ok(());
-        }
-
-        let mut buf_u64 = [0u8; 8];
-        if reader.read_exact(&mut buf_u64).is_err() {
-            return Ok(());
-        }
-        let count = u64::from_le_bytes(buf_u64);
-        if count > MAX_CACHE_ENTRIES {
-            return Ok(());
-        }
-
-        let mut buf_u16 = [0u8; 2];
-
-        for _ in 0..count {
-            if reader.read_exact(&mut buf_u16).is_err() {
-                break;
-            }
-            let path_len = u16::from_le_bytes(buf_u16) as usize;
-            if path_len == 0 || path_len > MAX_CACHE_PATH_BYTES {
-                break;
-            }
-
-            let mut path_buf = vec![0u8; path_len];
-            if reader.read_exact(&mut path_buf).is_err() {
-                break;
-            }
-
-            // We read back the string directly
-            let path_str = String::from_utf8_lossy(&path_buf).to_string();
-
-            let mut attr_buf = [0u8; 40];
-            if reader.read_exact(&mut attr_buf).is_err() {
-                break;
-            }
-
-            let mtime_sec = u64::from_le_bytes(attr_buf[0..8].try_into().unwrap());
-            let mtime_nanos = u32::from_le_bytes(attr_buf[8..12].try_into().unwrap());
-            let logical_size = u64::from_le_bytes(attr_buf[12..20].try_into().unwrap());
-            let allocated_size = u64::from_le_bytes(attr_buf[20..28].try_into().unwrap());
-            let ads_bytes = u64::from_le_bytes(attr_buf[28..36].try_into().unwrap());
-            let ads_count = u32::from_le_bytes(attr_buf[36..40].try_into().unwrap());
-
-            let entry = CachedAttributes {
-                mtime_sec,
-                mtime_nanos,
-                logical_size,
-                allocated_size,
-                ads_bytes,
-                ads_count,
-            };
-
-            let idx = self.shard_index(&path_str);
-            self.shards[idx].lock().unwrap().insert(path_str, entry);
-        }
-        Ok(())
+        let entry = CachedAttributes {
+            mtime_sec: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            mtime_nanos: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            logical_size: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
+            allocated_size: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+            vol_serial: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
+            file_id: u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
+        };
+        let idx = shard_index(shards.len(), &path_str);
+        shards[idx].lock().unwrap().insert(path_str, entry);
     }
+    Ok(())
+}
 
-    fn shard_index(&self, key: &str) -> usize {
-        let mut s = DefaultHasher::new();
-        key.hash(&mut s);
-        (s.finish() as usize) & (self.shards.len() - 1)
+/// Writes all entries to the database in a single transaction.
+fn write_snapshot(db: &Database, snapshot: &[(String, CachedAttributes)]) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    {
+        let mut table = write_txn
+            .open_table(SCAN_TABLE)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        for (path_str, attr) in snapshot {
+            let mut bytes = [0u8; 44];
+            bytes[0..8].copy_from_slice(&attr.mtime_sec.to_le_bytes());
+            bytes[8..12].copy_from_slice(&attr.mtime_nanos.to_le_bytes());
+            bytes[12..20].copy_from_slice(&attr.logical_size.to_le_bytes());
+            bytes[20..28].copy_from_slice(&attr.allocated_size.to_le_bytes());
+            bytes[28..36].copy_from_slice(&attr.vol_serial.to_le_bytes());
+            bytes[36..44].copy_from_slice(&attr.file_id.to_le_bytes());
+            table
+                .insert(path_str.as_str(), &bytes[..])
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+/// Opens or creates the redb database. If the file exists but is corrupt/old-format,
+/// removes it and starts fresh.
+fn open_or_recreate_db(path: &Path) -> io::Result<Database> {
+    match Database::create(path) {
+        Ok(db) => Ok(db),
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            Database::create(path)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+        }
     }
 }
 
+fn shard_index(num_shards: usize, key: &str) -> usize {
+    let mut s = DefaultHasher::new();
+    key.hash(&mut s);
+    (s.finish() as usize) & (num_shards - 1)
+}
+
 fn normalize_key(path: &Path) -> String {
-    // Lowercase the path string for cache consistency on Windows
     path.to_string_lossy().to_lowercase()
 }
 
@@ -458,6 +395,7 @@ impl Visited {
 pub struct ScanContext {
     options: ScanOptions,
     cache: Arc<ScanCache>,
+    dir_cache: Arc<DirScanCache>,
     visited: Arc<Visited>,
     progress: Option<Sender<ProgressEvent>>,
     cancel: CancelFlag,
@@ -483,7 +421,8 @@ impl ScanContext {
         )
     }
 
-    /// Creates a new ScanContext with a provided cache instance.
+    /// Creates a new ScanContext with a provided file-level cache; the
+    /// directory-level cache is initialised from its default on-disk location.
     pub fn with_cache(
         options: ScanOptions,
         progress: Option<Sender<ProgressEvent>>,
@@ -491,9 +430,26 @@ impl ScanContext {
         errors: ErrorStats,
         cache: Arc<ScanCache>,
     ) -> Self {
+        Self::with_caches(options, progress, cancel, errors, cache, Arc::new(DirScanCache::default()))
+    }
+
+    /// Creates a new ScanContext with explicit file-level and directory-level caches.
+    ///
+    /// Use this when the caller wants to share a single `DirScanCache` across
+    /// multiple navigation sessions so cached directory totals survive between
+    /// them without additional disk I/O.
+    pub fn with_caches(
+        options: ScanOptions,
+        progress: Option<Sender<ProgressEvent>>,
+        cancel: CancelFlag,
+        errors: ErrorStats,
+        cache: Arc<ScanCache>,
+        dir_cache: Arc<DirScanCache>,
+    ) -> Self {
         Self {
             options,
             cache,
+            dir_cache,
             visited: Arc::new(Visited::default()),
             progress,
             cancel,
@@ -503,9 +459,10 @@ impl ScanContext {
         }
     }
 
-    /// Saves the internal cache to disk.
+    /// Flushes both the file-level and directory-level caches to disk.
     pub fn save_cache(&self) -> io::Result<()> {
-        self.cache.save()
+        self.cache.save()?;
+        self.dir_cache.save()
     }
 
     /// Emits a progress event to the listener, if configured.
@@ -559,6 +516,38 @@ impl ScanContext {
         }
     }
 
+    /// Hard-link dedup using a file identity computed by the caller.
+    ///
+    /// This is the fast path used by the scanner: the scanner already opens a
+    /// single handle per file (for allocation size + ADS), reads
+    /// `BY_HANDLE_FILE_INFORMATION` from it, and passes the
+    /// `(volume_serial, file_index)` pair here. That avoids the extra
+    /// `CreateFileW` round-trip `mark_file_unique` would otherwise make via
+    /// [`file_identity`].
+    ///
+    /// `ids == None` means the caller could not open the file (locked/system
+    /// file); we then fall back to a canonical-path dedup, mirroring
+    /// [`Self::mark_file_unique`]'s fallback semantics.
+    #[cfg(windows)]
+    pub fn mark_file_unique_by_id(&self, ids: Option<(u64, u64)>, path: &Path) -> (bool, bool) {
+        if let Some((volume_serial, file_index)) = ids {
+            let id = FileIdentity::from_parts(volume_serial, file_index);
+            let idx = Visited::id_shard_index(&id);
+            let mut shard = self.visited.id_shards[idx].lock().unwrap();
+            let logical_new = shard.logical_ids.insert(id);
+            let alloc_new = shard.alloc_ids.insert(id);
+            return (logical_new, alloc_new);
+        }
+
+        if let Ok(normalized) = fs::canonicalize(path) {
+            let idx = Visited::path_shard_index(&normalized);
+            let mut shard = self.visited.path_shards[idx].lock().unwrap();
+            let alloc_new = shard.insert(normalized);
+            return (true, alloc_new);
+        }
+        (true, true)
+    }
+
     /// Atomically checks if a path has been visited and marks it.
     /// Returns `true` if the path is new (not previously visited).
     ///
@@ -595,9 +584,22 @@ impl ScanContext {
         self.options
     }
 
-    /// Returns a reference to the cache.
+    /// Returns `true` if a progress listener is attached.
+    ///
+    /// Used to skip `PathBuf` clones for progress events when nobody is
+    /// listening (e.g. a headless CLI scan without a live TUI).
+    pub fn has_progress(&self) -> bool {
+        self.progress.is_some()
+    }
+
+    /// Returns a reference to the file-level attribute cache.
     pub fn cache(&self) -> &ScanCache {
         self.cache.as_ref()
+    }
+
+    /// Returns a reference to the directory-level size cache.
+    pub fn dir_cache(&self) -> &DirScanCache {
+        self.dir_cache.as_ref()
     }
 
     /// Returns the cancellation flag.
@@ -638,6 +640,22 @@ impl ScanContext {
 struct FileIdentity {
     volume_serial: u64,
     file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+impl FileIdentity {
+    /// Builds an identity from the `(dwVolumeSerialNumber, 64-bit file index)`
+    /// pair the scanner reads out of `BY_HANDLE_FILE_INFORMATION`. The 64-bit
+    /// index is zero-padded into the 128-bit slot, matching the layout
+    /// produced by [`file_identity`].
+    fn from_parts(volume_serial: u64, file_index: u64) -> Self {
+        let mut file_id = [0u8; 16];
+        file_id[0..8].copy_from_slice(&file_index.to_le_bytes());
+        Self {
+            volume_serial,
+            file_id,
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -722,49 +740,30 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
-    use std::sync::Arc;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
-    struct FailingScanCacheFinalizer;
-
-    impl ScanCacheFinalizer for FailingScanCacheFinalizer {
-        fn finalize(&self, _temp_path: &Path, _final_path: &Path) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "simulated rename failure",
-            ))
-        }
-    }
-
     #[test]
-    fn save_returns_error_and_keeps_dirty_when_finalize_fails() {
+    fn round_trip_save_and_load() {
         let dir = tempdir().expect("failed to create temp directory");
-        let cache_path = dir.path().join("scan.cache");
-        let cache =
-            ScanCache::new_with_finalizer(cache_path.clone(), Arc::new(FailingScanCacheFinalizer));
-        let temp_path = cache_path.with_extension("tmp");
+        let cache_path = dir.path().join("scan.redb");
 
+        let cache = ScanCache::new(cache_path.clone());
         cache.insert_attributes(
             dir.path().join("item.txt"),
             Some(SystemTime::now()),
-            123,
-            456,
-            0,
-            0,
+            1024,
+            2048,
+            Some((42, 99)),
         );
+        cache.save().expect("save should succeed");
 
-        let err = cache
-            .save()
-            .expect_err("save should fail when finalization fails");
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let cache2 = ScanCache::new(cache_path);
+        let key = normalize_key(&dir.path().join("item.txt"));
+        let idx = shard_index(cache2.shards.len(), &key);
         assert!(
-            cache.dirty.load(AtomicOrdering::Relaxed),
-            "dirty should remain true after failed save finalization"
-        );
-        assert!(
-            temp_path.exists(),
-            "temp cache file should be preserved after failed finalization"
+            cache2.shards[idx].lock().unwrap().contains_key(&key),
+            "loaded cache should contain the saved entry"
         );
     }
 }

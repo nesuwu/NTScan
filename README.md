@@ -1,122 +1,117 @@
 # NTScan ![Build](https://github.com/nesuwu/NTScan/actions/workflows/rust.yml/badge.svg)
 
-NTScan is a Windows directory scanner focused on producing fast, aggregated
-size reports for NTFS volumes. It can operate in a traditional CLI mode or via
-an interactive TUI that keeps the current progress front and centre.
+A fast directory size scanner for Windows. Point it at an NTFS tree and it
+walks the whole thing in parallel, then shows you which folders are eating
+the disk. Use it from the command line or in a terminal UI. The core also
+builds as a DLL with a C ABI if you want to call it from your own code.
 
-## Features
+## What it does
 
-- Parallel traversal of directory trees with cooperative cancellation
-- Two scanning modes: `fast` (metadata only) and `accurate` (ADS + allocation)
-- Interactive TUI with sorting by name, size, or modification date
-- In-app Settings popup (`g`) to configure theme colors, cache paths, and defaults
-- Cycle guard for junctions and symlinks to avoid infinite recursion
-- Detailed error accounting for access, sharing, and ADS failures
+- Scans subdirectories the moment it finds them instead of waiting for a full listing
+- Two modes. **Fast** reads metadata only. **Accurate** also walks alternate data streams and reports real on-disk allocation
+- Counts hardlinked files once, not once per path
+- Finds duplicate files by content hash and caches the hashes between runs
+- TUI sorts by name, size, or date and has a settings panel
+- Won't loop forever on junctions or symlink cycles
+- Tracks why files failed: access denied, sharing violation, bad stream
 
-## Getting Started
+Windows only. It leans on Win32 directory enumeration, `NtQueryInformationFile`,
+and NTFS metadata, so it won't build on Linux, macOS, or any non-NTFS system
+(ReactOS untested).
 
-1. Install the latest stable Rust toolchain on Windows (`rustup default stable`).
-2. Clone the repository and fetch the dependencies:
-   ```powershell
-   git clone https://github.com/nesuwu/NTScan.git
-   cd NTScan
-   cargo fetch
-   ```
+## Build
+
+Requires the stable Rust toolchain on Windows.
+
+```powershell
+git clone https://github.com/nesuwu/NTScan.git
+cd NTScan
+cargo build --release
+```
+
+The binary is `target\release\ntscan.exe`.
 
 ## Usage
 
-### Fast metadata scan (default)
-
-```powershell
-cargo run --release -- "C:\Data"
+```
+ntscan [OPTIONS] [TARGET]
 ```
 
-### Accurate scan with ADS and allocation sizes
+`TARGET` defaults to the current directory.
+
+| Option | Effect |
+| --- | --- |
+| `--fast` | Force fast mode (metadata only). Conflicts with `--accurate`. |
+| `--accurate` | Accurate mode: include alternate data streams and allocation size. |
+| `--follow-symlinks` | Traverse symlinks and junctions; visited targets are skipped. |
+| `--duplicates` | Report duplicate files by content hash. |
+| `--min-size <BYTES>` | Minimum file size for duplicate detection. Default `1048576` (1 MiB). |
+| `--file` | List individual files, not just directory totals. |
+| `--delete-permanent` | Deletion features skip the Recycle Bin. Items are unrecoverable. |
+| `--debug` | Print only the final table; skip the TUI. |
+
+### Examples
 
 ```powershell
-cargo run --release -- --accurate "C:\Data"
+ntscan "C:\Data"
+ntscan --accurate "C:\Data"
+ntscan --duplicates --min-size 1048576 "C:\Data"
+ntscan --debug "C:\Data"
 ```
 
-### Follow symlinks and junctions safely
+### Cache locations
 
 ```powershell
-cargo run --release -- --follow-symlinks "C:\Data"
-```
-
-### Stream results to the console instead of the TUI
-
-```powershell
-cargo run --release -- --debug "C:\Data"
-```
-
-### Open the TUI settings popup
-
-While running the TUI, press `g` to open the settings popup (2/3-screen modal).
-Use `Up/Down` to select, `Left/Right` to toggle, `Enter` to edit text fields,
-and `Ctrl+S` to save persistent defaults.
-
-### Override cache file locations (optional)
-
-```powershell
-$env:NTSCAN_CACHE_PATH = "C:\Temp\ntscan\scan.cache"
+$env:NTSCAN_CACHE_PATH      = "C:\Temp\ntscan\scan.cache"
 $env:NTSCAN_HASH_CACHE_PATH = "C:\Temp\ntscan\hash.cache"
-cargo run --release -- "C:\Data"
 ```
 
-- `NTSCAN_CACHE_PATH` overrides the scanner metadata cache path.
-- `NTSCAN_HASH_CACHE_PATH` overrides the duplicate-hash cache path.
+- `NTSCAN_CACHE_PATH` sets the scanner metadata cache.
+- `NTSCAN_HASH_CACHE_PATH` sets the duplicate-hash cache.
 
-## TUI Keyboard Shortcuts
+Saved settings persist to `%LOCALAPPDATA%\ntscan\settings.conf`, or
+`%TEMP%\ntscan.settings.conf` when `LOCALAPPDATA` is unavailable.
 
-- `Up` / `Down`: Move selection
-- `PageUp` / `PageDown`: Scroll by a viewport-sized page
-- `Home` / `End`: Jump to the first or last entry
-- `s`: Cycle sorting mode (`Name → Size → Date`)
-- `g`: Open settings popup (theme/colors, cache paths, default scan behavior)
-- `q` or `Esc`: Quit (Ctrl+C also cancels the scan)
+## TUI Keys
 
-## Development
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` | Move selection |
+| `PageUp` / `PageDown` | Scroll one page |
+| `Home` / `End` | First / last entry |
+| `s` | Cycle sort: Name, Size, Date |
+| `g` | Open settings panel |
+| `q` / `Esc` | Quit (`Ctrl+C` cancels the scan) |
 
-Run the full quality gate locally before opening a PR:
+In the settings panel: `Up`/`Down` select, `Left`/`Right` toggle, `Enter`
+edits a text field, `Ctrl+S` saves persistent defaults.
 
-```powershell
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-```
+## Library / DLL
 
-The test run includes unit tests, integration tests, and documentation tests.
-
-Saved settings are persisted to `%LOCALAPPDATA%\ntscan\settings.conf` by default
-(or `%TEMP%\ntscan.settings.conf` when `LOCALAPPDATA` is unavailable).
-
-## Library + DLL Usage
-
-The scanner core is now UI-agnostic (`src/engine.rs`), and the TUI is split
-into smaller files:
-
-- `src/tui/types.rs`
-- `src/tui/app.rs`
-- `src/tui/render.rs`
-
-Build a **TUI-free DLL** for C#/PInvoke:
+The scanner core (`src/engine.rs`) is UI-agnostic. Build a TUI-free DLL:
 
 ```powershell
 cargo build --release --lib --no-default-features --features ffi
 ```
 
-On Windows this emits `target\release\ntscan.dll`.
+This emits `target\release\ntscan.dll`.
 
-### Exported C ABI
+### C ABI
 
-- `ntscan_scan_directory_json(path, mode, follow_symlinks, show_files, cache_path)`
-- `ntscan_find_duplicates_json(path, min_size, hash_cache_path)`
-- `ntscan_free_string(ptr)`
+```c
+char *ntscan_scan_directory_json(const char *path, unsigned int mode,
+                                 bool follow_symlinks, bool show_files,
+                                 const char *cache_path);
+char *ntscan_find_duplicates_json(const char *path, unsigned long long min_size,
+                                  const char *hash_cache_path);
+void  ntscan_free_string(char *ptr);
+```
 
-`mode`: `0 = Fast`, `1 = Accurate`  
-`cache_path`/`hash_cache_path`: pass `null` (or empty string) to use defaults.
+`mode` is `0` for fast, `1` for accurate. Pass `null` or an empty string for
+`cache_path` / `hash_cache_path` and it uses the defaults. Free every returned
+string with `ntscan_free_string` or you leak.
 
-### Minimal C# P/Invoke Sketch
+### C# P/Invoke
 
 ```csharp
 [DllImport("ntscan.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
@@ -132,6 +127,17 @@ private static extern IntPtr ntscan_find_duplicates_json(
 private static extern void ntscan_free_string(IntPtr ptr);
 ```
 
+## Development
+
+```powershell
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+`cargo test` runs the unit, integration, and doc tests. The `ci.*` scripts
+(`ci.ps1`, `ci.bat`, `ci.fish`, `ci.sh`) run all three steps in one go.
+
 ## License
 
-NTScan is distributed under the terms of the [MIT License](LICENSE).
+NTScan is forever free and licensed under the [MIT](LICENSE) license.

@@ -1,4 +1,5 @@
 pub mod args;
+pub mod cache;
 pub mod context;
 pub mod duplicates;
 pub mod engine;

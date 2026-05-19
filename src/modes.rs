@@ -20,6 +20,7 @@ use windows::Win32::Foundation::{BOOL, FALSE, TRUE};
 use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
 
 use crate::args::{Args, CLI_DEFAULT_MIN_SIZE};
+use crate::cache::DirScanCache;
 use crate::context::{CancelFlag, ScanCache, ScanContext};
 use crate::duplicates::print_duplicate_report;
 use crate::engine;
@@ -230,10 +231,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
         let mut options = options;
         let mut delete_permanent = args.delete_permanent;
         let mut shared_cache = Arc::new(scan_cache_from_settings(&settings));
+        let mut shared_dir_cache = Arc::new(DirScanCache::default());
         let (mut app, mut context, mut msg_rx) = start_scan_session(
             args.target.clone(),
             options,
             Arc::clone(&shared_cache),
+            Arc::clone(&shared_dir_cache),
             delete_permanent,
             settings.clone(),
         )?;
@@ -283,12 +286,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                         let child_path = target.clone();
 
                         app.request_cancel();
-                        let _ = context.save_cache();
 
                         let (next_app, next_context, next_rx) = start_scan_session(
                             target,
                             options,
                             Arc::clone(&shared_cache),
+                            Arc::clone(&shared_dir_cache),
                             delete_permanent,
                             settings.clone(),
                         )?;
@@ -332,12 +335,13 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                                 app = state.app;
                                 msg_rx = state.msg_rx;
 
-                                context = Arc::new(ScanContext::with_cache(
+                                context = Arc::new(ScanContext::with_caches(
                                     options,
                                     None,
                                     CancelFlag::new(),
                                     ErrorStats::default(),
                                     Arc::clone(&shared_cache),
+                                    Arc::clone(&shared_dir_cache),
                                 ));
 
                                 last_tick = Instant::now();
@@ -358,12 +362,13 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                                     new_cancel.clone(),
                                     new_tx.clone(),
                                 ) {
-                                    let scan_ctx = Arc::new(ScanContext::with_cache(
+                                    let scan_ctx = Arc::new(ScanContext::with_caches(
                                         options,
                                         None,
                                         new_cancel,
                                         restored_app.errors().clone(),
                                         Arc::clone(&shared_cache),
+                                        Arc::clone(&shared_dir_cache),
                                     ));
 
                                     // Mark the parent as visited for symlink
@@ -401,12 +406,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                                 // Parent listing changed, scan was incomplete,
                                 // or surgical path fell through.
                                 app.request_cancel();
-                                let _ = context.save_cache();
 
                                 let (next_app, next_context, next_rx) = start_scan_session(
                                     state.target,
                                     options,
                                     Arc::clone(&shared_cache),
+                                    Arc::clone(&shared_dir_cache),
                                     delete_permanent,
                                     settings.clone(),
                                 )?;
@@ -423,12 +428,12 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                         if !restored && let Some(parent) = app.target().parent() {
                             let target = parent.to_path_buf();
                             app.request_cancel();
-                            let _ = context.save_cache();
 
                             let (next_app, next_context, next_rx) = start_scan_session(
                                 target,
                                 options,
                                 Arc::clone(&shared_cache),
+                                Arc::clone(&shared_dir_cache),
                                 delete_permanent,
                                 settings.clone(),
                             )?;
@@ -452,6 +457,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                         delete_permanent = settings.default_delete_permanent;
 
                         shared_cache = Arc::new(scan_cache_from_settings(&settings));
+                        shared_dir_cache = Arc::new(DirScanCache::default());
                         history.clear();
 
                         let target = app.target().to_path_buf();
@@ -459,6 +465,7 @@ fn run_tui_mode(args: &Args, options: ScanOptions, initial_settings: AppSettings
                             target,
                             options,
                             Arc::clone(&shared_cache),
+                            Arc::clone(&shared_dir_cache),
                             delete_permanent,
                             settings.clone(),
                         )?;
@@ -493,18 +500,20 @@ fn start_scan_session(
     target: PathBuf,
     options: ScanOptions,
     cache: Arc<ScanCache>,
+    dir_cache: Arc<DirScanCache>,
     delete_permanent: bool,
     settings: AppSettings,
 ) -> Result<(App, Arc<ScanContext>, mpsc::Receiver<AppMessage>)> {
     let cancel = CancelFlag::new();
     let errors = ErrorStats::default();
 
-    let context = Arc::new(ScanContext::with_cache(
+    let context = Arc::new(ScanContext::with_caches(
         options,
         None,
         cancel.clone(),
         errors.clone(),
         cache,
+        dir_cache,
     ));
 
     if options.follow_symlinks

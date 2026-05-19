@@ -1,29 +1,28 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use redb::{Database, ReadableTable, TableDefinition};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 use crate::model::{DuplicateGroup, DuplicateScanResult};
 
-const HASH_CACHE_MAGIC: &[u8; 8] = b"NTSH0001";
 const HASH_CACHE_ENV_PATH: &str = "NTSCAN_HASH_CACHE_PATH";
-const MAX_HASH_CACHE_ENTRIES: u64 = 2_000_000;
-const MAX_HASH_CACHE_PATH_BYTES: usize = 16 * 1024;
+const HASH_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("hash_entries");
 
+/// All hashes are loaded into RAM on construction. The database handle is closed
+/// after loading so concurrent instances can coexist without file-lock conflicts.
 struct HashCache {
-    entries: Mutex<HashMap<String, CachedHash>>,
-    dirty: AtomicBool,
+    entries: HashMap<String, CachedHash>,
+    dirty: bool,
     file_path: PathBuf,
-    finalizer: Arc<dyn HashCacheFinalizer>,
-    save_error_logged: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -34,48 +33,27 @@ struct CachedHash {
     hash: [u8; 32],
 }
 
-trait HashCacheFinalizer: Send + Sync {
-    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()>;
-}
-
-struct StdHashCacheFinalizer;
-
-impl HashCacheFinalizer for StdHashCacheFinalizer {
-    fn finalize(&self, temp_path: &Path, final_path: &Path) -> io::Result<()> {
-        fs::rename(temp_path, final_path)
-    }
-}
-
 impl HashCache {
     fn new(path_override: Option<PathBuf>) -> Self {
         let file_path = path_override.unwrap_or_else(resolve_hash_cache_path);
-        let mut cache = Self::with_finalizer(file_path, Arc::new(StdHashCacheFinalizer));
-        let _ = cache.load();
-        cache
-    }
+        let mut entries = HashMap::new();
 
-    fn with_finalizer(file_path: PathBuf, finalizer: Arc<dyn HashCacheFinalizer>) -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            dirty: AtomicBool::new(false),
-            file_path,
-            finalizer,
-            save_error_logged: AtomicBool::new(false),
+        if let Ok(db) = Database::open(&file_path) {
+            let _ = load_hash_entries(&db, &mut entries);
+            // db dropped here — file lock released until save()
         }
-    }
 
-    #[cfg(test)]
-    fn new_with_finalizer(file_path: PathBuf, finalizer: Arc<dyn HashCacheFinalizer>) -> Self {
-        let mut cache = Self::with_finalizer(file_path, finalizer);
-        let _ = cache.load();
-        cache
+        Self {
+            entries,
+            dirty: false,
+            file_path,
+        }
     }
 
     fn get(&self, path: &Path, size: u64, mtime: Option<SystemTime>) -> Option<[u8; 32]> {
         let (mtime_sec, mtime_nanos) = system_time_to_tuple(mtime?);
         let key = path.to_string_lossy().to_lowercase();
-        let guard = self.entries.lock().unwrap();
-        if let Some(entry) = guard.get(&key)
+        if let Some(entry) = self.entries.get(&key)
             && entry.size == size
             && entry.mtime_sec == mtime_sec
             && entry.mtime_nanos == mtime_nanos
@@ -85,129 +63,96 @@ impl HashCache {
         None
     }
 
-    fn insert(&self, path: &Path, size: u64, mtime: Option<SystemTime>, hash: [u8; 32]) {
+    fn insert(&mut self, path: &Path, size: u64, mtime: Option<SystemTime>, hash: [u8; 32]) {
         let Some(mtime) = mtime else { return };
         let (mtime_sec, mtime_nanos) = system_time_to_tuple(mtime);
         let key = path.to_string_lossy().to_lowercase();
-        let entry = CachedHash {
-            mtime_sec,
-            mtime_nanos,
-            size,
-            hash,
-        };
-        self.entries.lock().unwrap().insert(key, entry);
-        self.dirty.store(true, Ordering::Relaxed);
-    }
-
-    fn load(&mut self) -> Result<()> {
-        if !self.file_path.exists() {
-            return Ok(());
-        }
-        let file = File::open(&self.file_path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut magic = [0u8; 8];
-        if reader.read_exact(&mut magic).is_err() || &magic != HASH_CACHE_MAGIC {
-            return Ok(());
-        }
-
-        let mut buf8 = [0u8; 8];
-        if reader.read_exact(&mut buf8).is_err() {
-            return Ok(());
-        }
-        let count = u64::from_le_bytes(buf8);
-        if count > MAX_HASH_CACHE_ENTRIES {
-            return Ok(());
-        }
-
-        let mut buf2 = [0u8; 2];
-        let mut guard = self.entries.lock().unwrap();
-
-        for _ in 0..count {
-            if reader.read_exact(&mut buf2).is_err() {
-                break;
-            }
-            let path_len = u16::from_le_bytes(buf2) as usize;
-            if path_len == 0 || path_len > MAX_HASH_CACHE_PATH_BYTES {
-                break;
-            }
-
-            let mut path_buf = vec![0u8; path_len];
-            if reader.read_exact(&mut path_buf).is_err() {
-                break;
-            }
-            let key = String::from_utf8_lossy(&path_buf).to_string();
-
-            let mut data = [0u8; 52];
-            if reader.read_exact(&mut data).is_err() {
-                break;
-            }
-
-            let entry = CachedHash {
-                mtime_sec: u64::from_le_bytes(data[0..8].try_into().unwrap()),
-                mtime_nanos: u32::from_le_bytes(data[8..12].try_into().unwrap()),
-                size: u64::from_le_bytes(data[12..20].try_into().unwrap()),
-                hash: data[20..52].try_into().unwrap(),
-            };
-            guard.insert(key, entry);
-        }
-        Ok(())
+        self.entries.insert(
+            key,
+            CachedHash {
+                mtime_sec,
+                mtime_nanos,
+                size,
+                hash,
+            },
+        );
+        self.dirty = true;
     }
 
     fn save(&self) -> Result<()> {
-        if !self.dirty.load(Ordering::Relaxed) {
+        if !self.dirty {
             return Ok(());
         }
-
-        let temp_path = self.file_path.with_extension("tmp");
-        let file = File::create(&temp_path)?;
-        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-
-        writer.write_all(HASH_CACHE_MAGIC)?;
-
-        let guard = self.entries.lock().unwrap();
-        writer.write_all(&(guard.len() as u64).to_le_bytes())?;
-
-        for (key, entry) in guard.iter() {
-            let key_bytes = key.as_bytes();
-            if key_bytes.len() > u16::MAX as usize {
-                continue;
+        let db = open_or_recreate_hash_db(&self.file_path)
+            .map_err(|e| anyhow::anyhow!("failed to open hash cache: {}", e))?;
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| anyhow::anyhow!("hash cache write txn: {}", e))?;
+        {
+            let mut table = write_txn
+                .open_table(HASH_TABLE)
+                .map_err(|e| anyhow::anyhow!("hash cache open table: {}", e))?;
+            for (key, entry) in &self.entries {
+                let mut bytes = [0u8; 52];
+                bytes[0..8].copy_from_slice(&entry.mtime_sec.to_le_bytes());
+                bytes[8..12].copy_from_slice(&entry.mtime_nanos.to_le_bytes());
+                bytes[12..20].copy_from_slice(&entry.size.to_le_bytes());
+                bytes[20..52].copy_from_slice(&entry.hash);
+                table
+                    .insert(key.as_str(), &bytes[..])
+                    .map_err(|e| anyhow::anyhow!("hash cache insert: {}", e))?;
             }
-            writer.write_all(&(key_bytes.len() as u16).to_le_bytes())?;
-            writer.write_all(key_bytes)?;
-            writer.write_all(&entry.mtime_sec.to_le_bytes())?;
-            writer.write_all(&entry.mtime_nanos.to_le_bytes())?;
-            writer.write_all(&entry.size.to_le_bytes())?;
-            writer.write_all(&entry.hash)?;
         }
+        write_txn
+            .commit()
+            .map_err(|e| anyhow::anyhow!("hash cache commit: {}", e))
+    }
+}
 
-        writer.flush()?;
-        drop(writer);
-        drop(guard);
-
-        if let Err(err) = self.finalizer.finalize(&temp_path, &self.file_path) {
-            let contextual_err = io::Error::new(
-                err.kind(),
-                format!(
-                    "failed to finalize hash cache save ({} -> {}): {}",
-                    temp_path.display(),
-                    self.file_path.display(),
-                    err
-                ),
-            );
-            if !self.save_error_logged.swap(true, Ordering::Relaxed) {
-                eprintln!(
-                    "warning: {}. temp hash cache file left at {}",
-                    contextual_err,
-                    temp_path.display()
-                );
-            }
-            return Err(contextual_err.into());
+fn load_hash_entries(db: &Database, entries: &mut HashMap<String, CachedHash>) -> Result<()> {
+    let read_txn = match db.begin_read() {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let table = match read_txn.open_table(HASH_TABLE) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let iter = match table.iter() {
+        Ok(it) => it,
+        Err(_) => return Ok(()),
+    };
+    for result in iter {
+        let (key, value) = match result {
+            Ok(kv) => kv,
+            Err(_) => break,
+        };
+        let path_str = key.value().to_string();
+        let bytes = value.value();
+        if bytes.len() < 52 {
+            continue;
         }
+        entries.insert(
+            path_str,
+            CachedHash {
+                mtime_sec: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                mtime_nanos: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                size: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
+                hash: bytes[20..52].try_into().unwrap(),
+            },
+        );
+    }
+    Ok(())
+}
 
-        self.save_error_logged.store(false, Ordering::Relaxed);
-        self.dirty.store(false, Ordering::Relaxed);
-        Ok(())
+fn open_or_recreate_hash_db(path: &Path) -> std::io::Result<Database> {
+    match Database::create(path) {
+        Ok(db) => Ok(db),
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            Database::create(path)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        }
     }
 }
 
@@ -311,7 +256,7 @@ pub fn find_duplicates_with_cache(
     let total_to_hash: u64 = candidates.iter().map(|(_, p)| p.len() as u64).sum();
     eprintln!("Found {} potential duplicates to hash", total_to_hash);
 
-    let cache = HashCache::new(hash_cache_path);
+    let mut cache = HashCache::new(hash_cache_path);
     let progress = Progress::new(total_to_hash);
     let mut groups: Vec<DuplicateGroup> = Vec::new();
 
@@ -488,49 +433,24 @@ pub fn print_duplicate_report(result: &DuplicateScanResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
-    struct FailingHashCacheFinalizer;
-
-    impl HashCacheFinalizer for FailingHashCacheFinalizer {
-        fn finalize(&self, _temp_path: &Path, _final_path: &Path) -> io::Result<()> {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "simulated rename failure",
-            ))
-        }
-    }
-
     #[test]
-    fn save_returns_error_and_keeps_dirty_when_finalize_fails() {
+    fn round_trip_save_and_load() {
         let dir = tempdir().expect("failed to create temp directory");
-        let cache_path = dir.path().join("hash.cache");
-        let cache =
-            HashCache::new_with_finalizer(cache_path.clone(), Arc::new(FailingHashCacheFinalizer));
-        let temp_path = cache_path.with_extension("tmp");
+        let cache_path = dir.path().join("hash.redb");
+        let file_path = dir.path().join("item.bin");
 
-        cache.insert(
-            &dir.path().join("item.bin"),
-            64,
-            Some(SystemTime::now()),
-            [7u8; 32],
-        );
+        let mut cache = HashCache::new(Some(cache_path.clone()));
+        cache.insert(&file_path, 64, Some(SystemTime::now()), [7u8; 32]);
+        cache.save().expect("save should succeed");
 
-        let err = cache
-            .save()
-            .expect_err("save should fail when finalization fails");
+        let cache2 = HashCache::new(Some(cache_path));
+        let key = file_path.to_string_lossy().to_lowercase();
         assert!(
-            err.to_string()
-                .contains("failed to finalize hash cache save"),
-            "error should surface hash cache finalization failure"
-        );
-        assert!(
-            cache.dirty.load(Ordering::Relaxed),
-            "dirty should remain true after failed save finalization"
-        );
-        assert!(
-            temp_path.exists(),
-            "temp cache file should be preserved after failed finalization"
+            cache2.entries.contains_key(&key),
+            "loaded cache should contain the saved entry"
         );
     }
 }
