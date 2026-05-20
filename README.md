@@ -16,7 +16,7 @@ builds as a DLL with a C ABI if you want to call it from your own code.
 - Tracks why files failed: access denied, sharing violation, bad stream
 
 Windows only. It leans on Win32 directory enumeration, `NtQueryInformationFile`,
-and NTFS metadata, so it won't build on Linux, macOS, or any non-NTFS system
+and NTFS metadata, so it won't build on Linux, macOS, or any non-NT Kernel based system
 (ReactOS untested).
 
 ## Build
