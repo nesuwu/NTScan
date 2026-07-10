@@ -48,6 +48,9 @@ pub enum ScanErrorKind {
     SharingViolation,
     ADSFailed,
     Cancelled,
+    /// A persistent cache could not be loaded or saved; scanning continues
+    /// but results aren't cached across runs.
+    CacheFailed,
     Other,
 }
 

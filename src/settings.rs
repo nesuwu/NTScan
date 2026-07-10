@@ -13,6 +13,8 @@ pub enum ThemePreset {
     Ocean,
     Amber,
     Forest,
+    /// User-defined palette from the `custom_*` hex colors.
+    Custom,
 }
 
 impl ThemePreset {
@@ -22,6 +24,7 @@ impl ThemePreset {
             ThemePreset::Ocean => "ocean",
             ThemePreset::Amber => "amber",
             ThemePreset::Forest => "forest",
+            ThemePreset::Custom => "custom",
         }
     }
 
@@ -31,6 +34,7 @@ impl ThemePreset {
             ThemePreset::Ocean => "Ocean",
             ThemePreset::Amber => "Amber",
             ThemePreset::Forest => "Forest",
+            ThemePreset::Custom => "Custom",
         }
     }
 
@@ -43,6 +47,8 @@ impl ThemePreset {
             Some(ThemePreset::Amber)
         } else if value.eq_ignore_ascii_case("forest") {
             Some(ThemePreset::Forest)
+        } else if value.eq_ignore_ascii_case("custom") {
+            Some(ThemePreset::Custom)
         } else {
             None
         }
@@ -53,18 +59,68 @@ impl ThemePreset {
             ThemePreset::Default => ThemePreset::Ocean,
             ThemePreset::Ocean => ThemePreset::Amber,
             ThemePreset::Amber => ThemePreset::Forest,
-            ThemePreset::Forest => ThemePreset::Default,
+            ThemePreset::Forest => ThemePreset::Custom,
+            ThemePreset::Custom => ThemePreset::Default,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            ThemePreset::Default => ThemePreset::Forest,
+            ThemePreset::Default => ThemePreset::Custom,
             ThemePreset::Ocean => ThemePreset::Default,
             ThemePreset::Amber => ThemePreset::Ocean,
             ThemePreset::Forest => ThemePreset::Amber,
+            ThemePreset::Custom => ThemePreset::Forest,
         }
     }
+}
+
+/// RGB triples for the six palette roles, used when the theme is `Custom`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CustomColors {
+    pub ok: (u8, u8, u8),
+    pub error: (u8, u8, u8),
+    pub pending: (u8, u8, u8),
+    pub running: (u8, u8, u8),
+    pub parent: (u8, u8, u8),
+    pub border: (u8, u8, u8),
+}
+
+impl Default for CustomColors {
+    fn default() -> Self {
+        // Starts as a truecolor take on the Default preset so switching to
+        // Custom never produces an unreadable UI.
+        Self {
+            ok: (0x22, 0xc5, 0x5e),
+            error: (0xef, 0x44, 0x44),
+            pending: (0x6b, 0x72, 0x80),
+            running: (0xea, 0xb3, 0x08),
+            parent: (0x22, 0xd3, 0xee),
+            border: (0xe5, 0xe7, 0xeb),
+        }
+    }
+}
+
+/// Parses `#rrggbb`, `rrggbb`, or shorthand `#rgb` into an RGB triple.
+pub fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let hex = value.trim().trim_start_matches('#');
+    match hex.len() {
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some((r, g, b))
+        }
+        3 => {
+            let digit = |i: usize| u8::from_str_radix(&hex[i..=i], 16).ok().map(|v| v * 17);
+            Some((digit(0)?, digit(1)?, digit(2)?))
+        }
+        _ => None,
+    }
+}
+
+pub fn format_hex_color((r, g, b): (u8, u8, u8)) -> String {
+    format!("#{:02x}{:02x}{:02x}", r, g, b)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +133,10 @@ pub struct AppSettings {
     pub scan_cache_path: Option<PathBuf>,
     pub hash_cache_path: Option<PathBuf>,
     pub theme: ThemePreset,
+    pub custom_colors: CustomColors,
+    /// The interactive tutorial runs once on first launch; this flips to
+    /// `true` afterwards. `--tutorial` replays it regardless.
+    pub tutorial_seen: bool,
 }
 
 impl Default for AppSettings {
@@ -90,6 +150,8 @@ impl Default for AppSettings {
             scan_cache_path: None,
             hash_cache_path: None,
             theme: ThemePreset::Default,
+            custom_colors: CustomColors::default(),
+            tutorial_seen: false,
         }
     }
 }
@@ -189,6 +251,41 @@ fn parse_settings(content: &str) -> AppSettings {
                     settings.theme = theme;
                 }
             }
+            "tutorial_seen" => {
+                if let Some(v) = parse_bool(value) {
+                    settings.tutorial_seen = v;
+                }
+            }
+            "custom_ok" => {
+                if let Some(c) = parse_hex_color(value) {
+                    settings.custom_colors.ok = c;
+                }
+            }
+            "custom_error" => {
+                if let Some(c) = parse_hex_color(value) {
+                    settings.custom_colors.error = c;
+                }
+            }
+            "custom_pending" => {
+                if let Some(c) = parse_hex_color(value) {
+                    settings.custom_colors.pending = c;
+                }
+            }
+            "custom_running" => {
+                if let Some(c) = parse_hex_color(value) {
+                    settings.custom_colors.running = c;
+                }
+            }
+            "custom_parent" => {
+                if let Some(c) = parse_hex_color(value) {
+                    settings.custom_colors.parent = c;
+                }
+            }
+            "custom_border" => {
+                if let Some(c) = parse_hex_color(value) {
+                    settings.custom_colors.border = c;
+                }
+            }
             _ => {}
         }
     }
@@ -224,7 +321,14 @@ fn serialize_settings(settings: &AppSettings) -> String {
             "min_duplicate_size={min_duplicate_size}\n",
             "scan_cache_path={scan_cache_path}\n",
             "hash_cache_path={hash_cache_path}\n",
-            "theme={theme}\n"
+            "theme={theme}\n",
+            "custom_ok={custom_ok}\n",
+            "custom_error={custom_error}\n",
+            "custom_pending={custom_pending}\n",
+            "custom_running={custom_running}\n",
+            "custom_parent={custom_parent}\n",
+            "custom_border={custom_border}\n",
+            "tutorial_seen={tutorial_seen}\n"
         ),
         mode = mode,
         follow = settings.default_follow_symlinks,
@@ -234,6 +338,13 @@ fn serialize_settings(settings: &AppSettings) -> String {
         scan_cache_path = scan_cache_path,
         hash_cache_path = hash_cache_path,
         theme = settings.theme.as_str(),
+        custom_ok = format_hex_color(settings.custom_colors.ok),
+        custom_error = format_hex_color(settings.custom_colors.error),
+        custom_pending = format_hex_color(settings.custom_colors.pending),
+        custom_running = format_hex_color(settings.custom_colors.running),
+        custom_parent = format_hex_color(settings.custom_colors.parent),
+        custom_border = format_hex_color(settings.custom_colors.border),
+        tutorial_seen = settings.tutorial_seen,
     )
 }
 
@@ -277,7 +388,16 @@ mod tests {
             min_duplicate_size: 42,
             scan_cache_path: Some(PathBuf::from("C:\\cache\\scan.cache")),
             hash_cache_path: Some(PathBuf::from("C:\\cache\\hash.cache")),
-            theme: ThemePreset::Forest,
+            theme: ThemePreset::Custom,
+            custom_colors: CustomColors {
+                ok: (0xa6, 0xe3, 0xa1),
+                error: (0xf3, 0x8b, 0xa8),
+                pending: (0x58, 0x5b, 0x70),
+                running: (0xf9, 0xe2, 0xaf),
+                parent: (0x89, 0xdc, 0xeb),
+                border: (0xcd, 0xd6, 0xf4),
+            },
+            tutorial_seen: true,
         };
 
         let encoded = serialize_settings(&settings);
@@ -292,9 +412,22 @@ mod tests {
             "default_mode=unknown\n\
              default_follow_symlinks=maybe\n\
              min_duplicate_size=abc\n\
-             theme=invalid\n",
+             theme=invalid\n\
+             custom_ok=notahex\n\
+             custom_border=#12345\n",
         );
 
         assert_eq!(parsed, AppSettings::default());
+    }
+
+    #[test]
+    fn hex_color_parsing_accepts_common_forms() {
+        assert_eq!(parse_hex_color("#a6e3a1"), Some((0xa6, 0xe3, 0xa1)));
+        assert_eq!(parse_hex_color("A6E3A1"), Some((0xa6, 0xe3, 0xa1)));
+        assert_eq!(parse_hex_color("#fff"), Some((255, 255, 255)));
+        assert_eq!(parse_hex_color(" #000 "), Some((0, 0, 0)));
+        assert_eq!(parse_hex_color("#12345"), None);
+        assert_eq!(parse_hex_color("zzzzzz"), None);
+        assert_eq!(format_hex_color((0xa6, 0xe3, 0xa1)), "#a6e3a1");
     }
 }

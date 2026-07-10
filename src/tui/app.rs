@@ -17,6 +17,9 @@ pub struct AppParams {
     pub delete_permanent: bool,
     pub msg_tx: Option<mpsc::Sender<AppMessage>>,
     pub settings: AppSettings,
+    /// True when the directory cache loaded empty — the header shows a
+    /// one-time "first scan" hint until the scan completes.
+    pub cold_cache: bool,
 }
 
 /// The main TUI application state.
@@ -58,6 +61,8 @@ pub struct App {
     error_popup: Option<String>,
     settings: AppSettings,
     settings_popup: Option<SettingsPopupState>,
+    help_popup: bool,
+    cold_cache: bool,
 }
 impl App {
     /// Creates a new TUI application instance.
@@ -76,6 +81,7 @@ impl App {
             delete_permanent,
             msg_tx,
             settings,
+            cold_cache,
         } = params;
         let total_dirs = directories.len();
         let directories = directories
@@ -104,7 +110,7 @@ impl App {
             should_quit: false,
             cancel,
             errors,
-            sort_mode: SortMode::Size,
+            sort_mode: SortMode::DEFAULT,
             selected: 0,
             offset: 0,
             last_viewport: 0,
@@ -118,6 +124,8 @@ impl App {
             error_popup: None,
             settings,
             settings_popup: None,
+            help_popup: false,
+            cold_cache,
         }
     }
 
@@ -163,6 +171,11 @@ impl App {
             return None;
         }
 
+        if self.help_popup {
+            self.help_popup = false;
+            return None;
+        }
+
         if self.settings_popup.is_some() {
             return self.handle_settings_key(key);
         }
@@ -200,11 +213,23 @@ impl App {
                 self.errors.record(ScanErrorKind::Cancelled);
                 None
             }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.cycle_sort();
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.help_popup = true;
                 None
             }
-            KeyCode::Char('g') | KeyCode::Char('G') => {
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.set_sort(SortKey::Name);
+                None
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.set_sort(SortKey::Size);
+                None
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.set_sort(SortKey::Date);
+                None
+            }
+            KeyCode::Char('g') | KeyCode::Char('G') | KeyCode::F(2) => {
                 self.open_settings_popup();
                 None
             }
@@ -212,11 +237,11 @@ impl App {
                 self.prepare_delete();
                 None
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
                 self.move_selection_by(1);
                 None
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                 self.move_selection_by(-1);
                 None
             }
@@ -236,14 +261,41 @@ impl App {
                 self.move_to_bottom();
                 None
             }
-            KeyCode::Enter => self.activate_selection(),
-            KeyCode::Backspace => Some(AppAction::GoBack),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.activate_selection()
+            }
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                Some(AppAction::GoBack)
+            }
             _ => None,
         }
     }
 
     fn palette(&self) -> ThemePalette {
-        ThemePalette::from_theme(self.settings.theme)
+        // Live preview: while the settings popup is open, colors follow the
+        // draft so cycling the theme (or editing hex colors) shows immediately.
+        let settings = self
+            .settings_popup
+            .as_ref()
+            .map(|popup| &popup.draft)
+            .unwrap_or(&self.settings);
+        ThemePalette::from_settings(settings)
+    }
+
+    /// Field currently selected in the settings popup, resolved against the
+    /// draft-dependent visible list (Custom theme reveals extra rows).
+    fn settings_field_at(popup: &SettingsPopupState) -> SettingsField {
+        let fields = SettingsField::visible(&popup.draft);
+        fields[popup.selected.min(fields.len() - 1)]
+    }
+
+    /// Refreshes settings on a restored (history) App so cosmetic changes
+    /// made elsewhere — theme, delete mode — survive back-navigation.
+    pub fn update_settings(&mut self, settings: AppSettings) {
+        self.delete_permanent = settings.default_delete_permanent;
+        self.settings = settings;
+        // Row styles bake in the palette; force a rebuild.
+        self.rows_dirty = true;
     }
 
     fn open_settings_popup(&mut self) {
@@ -256,8 +308,8 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) -> Option<AppAction> {
-        let mut should_close = false;
-        let mut saved_settings: Option<AppSettings> = None;
+        let saved = self.settings.clone();
+        let mut close_and_apply = false;
         let mut error_message: Option<String> = None;
 
         {
@@ -270,7 +322,7 @@ impl App {
                         popup.input.clear();
                     }
                     KeyCode::Enter => {
-                        let field = SettingsField::from_index(popup.selected);
+                        let field = Self::settings_field_at(popup);
                         let result =
                             Self::apply_text_field(field, &mut popup.draft, popup.input.trim());
                         match result {
@@ -299,22 +351,26 @@ impl App {
             }
 
             match key.code {
-                KeyCode::Esc => should_close = true,
-                KeyCode::Up => {
+                // Esc applies and saves — no separate save chord to forget.
+                KeyCode::Esc | KeyCode::Char('q') => close_and_apply = true,
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    close_and_apply = true;
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
                     popup.selected = popup.selected.saturating_sub(1);
                 }
-                KeyCode::Down => {
-                    let max = SettingsField::ALL.len().saturating_sub(1);
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                    let max = SettingsField::visible(&popup.draft).len().saturating_sub(1);
                     popup.selected = (popup.selected + 1).min(max);
                 }
-                KeyCode::Left => {
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
                     Self::step_field_value(popup, false);
                 }
-                KeyCode::Right => {
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
                     Self::step_field_value(popup, true);
                 }
-                KeyCode::Enter => {
-                    let field = SettingsField::from_index(popup.selected);
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let field = Self::settings_field_at(popup);
                     if field.is_text() {
                         popup.editing = true;
                         popup.input = Self::field_input_value(field, &popup.draft);
@@ -322,37 +378,53 @@ impl App {
                         Self::step_field_value(popup, true);
                     }
                 }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    saved_settings = Some(popup.draft.clone());
+                KeyCode::Char('z') | KeyCode::Char('Z') => {
+                    popup.draft = saved.clone();
+                    // Undo may hide the custom-color rows; keep the cursor valid.
+                    let max = SettingsField::visible(&popup.draft).len().saturating_sub(1);
+                    popup.selected = popup.selected.min(max);
                 }
                 _ => {}
             }
         }
 
-        if should_close {
-            self.settings_popup = None;
+        // Stepped values may recolor rows (theme) — rebuild lazily.
+        self.rows_dirty = true;
+
+        if !close_and_apply {
             return None;
         }
 
-        if let Some(new_settings) = saved_settings {
-            match save_settings(&new_settings) {
-                Ok(()) => {
-                    self.settings = new_settings.clone();
-                    self.delete_permanent = new_settings.default_delete_permanent;
-                    self.settings_popup = None;
-                    return Some(AppAction::ApplySettings(new_settings));
-                }
-                Err(err) => {
-                    self.error_popup = Some(format!("Failed to save settings:\n{}", err));
-                }
-            }
+        let popup = self.settings_popup.take()?;
+        if popup.draft == saved {
+            return None;
         }
 
-        None
+        if let Err(err) = save_settings(&popup.draft) {
+            // Keep the popup (and the user's edits) alive on save failure.
+            let selected = popup.selected;
+            self.settings_popup = Some(SettingsPopupState {
+                selected,
+                editing: false,
+                input: String::new(),
+                draft: popup.draft,
+            });
+            self.error_popup = Some(format!("Failed to save settings:\n{}", err));
+            return None;
+        }
+
+        let needs_restart = settings_require_restart(&saved, &popup.draft);
+        self.delete_permanent = popup.draft.default_delete_permanent;
+        self.settings = popup.draft.clone();
+        if needs_restart {
+            Some(AppAction::ApplySettings(popup.draft))
+        } else {
+            Some(AppAction::UpdateSettings(popup.draft))
+        }
     }
 
     fn step_field_value(popup: &mut SettingsPopupState, forward: bool) {
-        match SettingsField::from_index(popup.selected) {
+        match Self::settings_field_at(popup) {
             SettingsField::Theme => {
                 popup.draft.theme = if forward {
                     popup.draft.theme.next()
@@ -375,9 +447,24 @@ impl App {
             SettingsField::DeletePermanent => {
                 popup.draft.default_delete_permanent = !popup.draft.default_delete_permanent;
             }
-            SettingsField::DuplicateMinSize
-            | SettingsField::ScanCachePath
-            | SettingsField::HashCachePath => {}
+            SettingsField::DuplicateMinSize => {
+                // Halve/double within sane bounds; Enter still types an exact value.
+                const MIN: u64 = 4 * 1024;
+                const MAX: u64 = 64 * 1024 * 1024 * 1024;
+                let current = popup.draft.min_duplicate_size.clamp(MIN, MAX);
+                popup.draft.min_duplicate_size = if forward {
+                    current.saturating_mul(2).min(MAX)
+                } else {
+                    (current / 2).max(MIN)
+                };
+            }
+            SettingsField::ScanCachePath | SettingsField::HashCachePath => {}
+            SettingsField::CustomOk
+            | SettingsField::CustomError
+            | SettingsField::CustomPending
+            | SettingsField::CustomRunning
+            | SettingsField::CustomParent
+            | SettingsField::CustomBorder => {}
         }
     }
 
@@ -394,6 +481,12 @@ impl App {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            SettingsField::CustomOk
+            | SettingsField::CustomError
+            | SettingsField::CustomPending
+            | SettingsField::CustomRunning
+            | SettingsField::CustomParent
+            | SettingsField::CustomBorder => field.display_value(draft),
             _ => String::new(),
         }
     }
@@ -427,6 +520,25 @@ impl App {
                     draft.hash_cache_path = None;
                 } else {
                     draft.hash_cache_path = Some(PathBuf::from(raw_value));
+                }
+                Ok(())
+            }
+            SettingsField::CustomOk
+            | SettingsField::CustomError
+            | SettingsField::CustomPending
+            | SettingsField::CustomRunning
+            | SettingsField::CustomParent
+            | SettingsField::CustomBorder => {
+                let color = parse_hex_color(raw_value)
+                    .ok_or_else(|| String::from("Enter a hex color like #a6e3a1 (or #fff)"))?;
+                match field {
+                    SettingsField::CustomOk => draft.custom_colors.ok = color,
+                    SettingsField::CustomError => draft.custom_colors.error = color,
+                    SettingsField::CustomPending => draft.custom_colors.pending = color,
+                    SettingsField::CustomRunning => draft.custom_colors.running = color,
+                    SettingsField::CustomParent => draft.custom_colors.parent = color,
+                    SettingsField::CustomBorder => draft.custom_colors.border = color,
+                    _ => unreachable!(),
                 }
                 Ok(())
             }
@@ -560,8 +672,8 @@ impl App {
         }
     }
 
-    fn cycle_sort(&mut self) {
-        self.sort_mode = self.sort_mode.next();
+    fn set_sort(&mut self, key: SortKey) {
+        self.sort_mode = self.sort_mode.toggle(key);
         self.rows_dirty = true;
         let total = self.total_rows();
         self.ensure_selection_bounds(total);
@@ -1007,23 +1119,20 @@ impl App {
                 modified_text: "-".to_string(),
                 ads_text: "-".to_string(),
                 percent_text: if total_logical > 0 {
-                    format!(
-                        "{:.2}",
-                        (self.file_logical as f64 / total_logical as f64) * 100.0
-                    )
+                    percent_bar((self.file_logical as f64 / total_logical as f64) * 100.0)
                 } else {
-                    "0.00".to_string()
+                    percent_bar(0.0)
                 },
                 style: Style::default().fg(palette.ok),
                 origin: RowOrigin::Files,
             });
         }
 
-        match self.sort_mode {
-            SortMode::Name => {
+        match self.sort_mode.key {
+            SortKey::Name => {
                 rows.sort_by_key(|row| row.name_key.clone());
             }
-            SortMode::Size => {
+            SortKey::Size => {
                 rows.sort_by_key(|row| {
                     (
                         row.logical_sort.is_none(),
@@ -1032,7 +1141,7 @@ impl App {
                     )
                 });
             }
-            SortMode::Date => {
+            SortKey::Date => {
                 rows.sort_by_key(|row| {
                     (
                         row.modified_sort.is_none(),
@@ -1041,6 +1150,9 @@ impl App {
                     )
                 });
             }
+        }
+        if self.sort_mode.reverse {
+            rows.reverse();
         }
 
         if self.target.parent().is_some() {
@@ -1067,7 +1179,7 @@ impl App {
         rows
     }
 
-    fn visible_rows(&mut self, viewport: usize) -> Vec<Row<'static>> {
+    fn visible_rows(&mut self, viewport: usize, show_accurate: bool) -> Vec<Row<'static>> {
         let viewport = viewport.max(1);
         self.ensure_rows();
         let total = self.rows_cache.len();
@@ -1085,7 +1197,10 @@ impl App {
         let mut rows = Vec::with_capacity(end.saturating_sub(start));
         for (idx, row) in self.rows_cache[start..end].iter().enumerate() {
             let absolute_index = start + idx;
-            rows.push(row.clone().into_row(absolute_index == self.selected));
+            rows.push(
+                row.clone()
+                    .into_row(absolute_index == self.selected, show_accurate),
+            );
         }
         rows
     }

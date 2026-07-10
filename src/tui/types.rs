@@ -19,7 +19,9 @@ use crate::model::{
     ChildJob, DirectoryReport, EntryKind, EntryReport, ErrorStats, ScanErrorKind, ScanMode,
 };
 use crate::report::format_size;
-use crate::settings::{AppSettings, ThemePreset, save_settings};
+use crate::settings::{
+    AppSettings, ThemePreset, format_hex_color, parse_hex_color, save_settings,
+};
 use time::OffsetDateTime;
 use time::macros::format_description;
 
@@ -67,33 +69,79 @@ pub enum AppMessage {
 pub enum AppAction {
     ChangeDirectory(PathBuf),
     GoBack,
+    /// Settings changed in a way that requires restarting the scan session
+    /// (mode, symlinks, show-files, scan cache path).
     ApplySettings(AppSettings),
+    /// Settings changed cosmetically (theme, delete mode, duplicate options);
+    /// the runner only refreshes its copy — no rescan.
+    UpdateSettings(AppSettings),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Available sorting modes for the file list.
-enum SortMode {
+/// Available sorting columns for the file list.
+enum SortKey {
     Name,
     Size,
     Date,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Sort column plus direction. `reverse == false` is the key's natural
+/// direction: name ascending, size and date descending.
+struct SortMode {
+    key: SortKey,
+    reverse: bool,
+}
+
 impl SortMode {
-    fn label(self) -> &'static str {
-        match self {
-            SortMode::Name => "name ↑",
-            SortMode::Size => "size ↓",
-            SortMode::Date => "date ↓",
+    const DEFAULT: SortMode = SortMode {
+        key: SortKey::Size,
+        reverse: false,
+    };
+
+    /// Pressing a sort key switches to it in its natural direction;
+    /// pressing the active key again flips the direction.
+    fn toggle(self, key: SortKey) -> Self {
+        SortMode {
+            key,
+            reverse: self.key == key && !self.reverse,
         }
     }
 
-    fn next(self) -> Self {
-        match self {
-            SortMode::Name => SortMode::Size,
-            SortMode::Size => SortMode::Date,
-            SortMode::Date => SortMode::Name,
+    fn label(self) -> String {
+        let name = match self.key {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Date => "date",
+        };
+        format!("{} {}", name, self.arrow())
+    }
+
+    /// Current direction as a table-header arrow.
+    fn arrow(self) -> &'static str {
+        let natural_ascending = self.key == SortKey::Name;
+        if natural_ascending != self.reverse {
+            "▲"
+        } else {
+            "▼"
         }
     }
+}
+
+/// Renders a compact usage bar like `███░░░░░  42.1` for a percentage.
+fn percent_bar(percent: f64) -> String {
+    const WIDTH: usize = 8;
+    let clamped = if percent.is_finite() {
+        percent.clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let filled = ((clamped / 100.0) * WIDTH as f64).round() as usize;
+    let mut bar = String::with_capacity(WIDTH * 3 + 6);
+    for i in 0..WIDTH {
+        bar.push(if i < filled { '█' } else { '░' });
+    }
+    format!("{} {:>5.1}", bar, clamped)
 }
 
 #[derive(Clone, Copy)]
@@ -107,8 +155,29 @@ struct ThemePalette {
 }
 
 impl ThemePalette {
+    /// Resolves the palette for the active theme; `Custom` reads the
+    /// user-defined hex colors.
+    fn from_settings(settings: &AppSettings) -> Self {
+        if settings.theme == ThemePreset::Custom {
+            let rgb = |(r, g, b): (u8, u8, u8)| Color::Rgb(r, g, b);
+            let colors = settings.custom_colors;
+            return Self {
+                ok: rgb(colors.ok),
+                error: rgb(colors.error),
+                pending: rgb(colors.pending),
+                running: rgb(colors.running),
+                parent: rgb(colors.parent),
+                border: rgb(colors.border),
+            };
+        }
+        Self::from_theme(settings.theme)
+    }
+
     fn from_theme(theme: ThemePreset) -> Self {
         match theme {
+            // Custom is resolved in from_settings; this arm is unreachable
+            // there but keeps the match total.
+            ThemePreset::Custom => Self::from_theme(ThemePreset::Default),
             ThemePreset::Default => Self {
                 ok: Color::Green,
                 error: Color::Red,
@@ -145,9 +214,15 @@ impl ThemePalette {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SettingsField {
     Theme,
+    CustomOk,
+    CustomError,
+    CustomPending,
+    CustomRunning,
+    CustomParent,
+    CustomBorder,
     DefaultMode,
     FollowSymlinks,
     ShowFiles,
@@ -158,8 +233,16 @@ enum SettingsField {
 }
 
 impl SettingsField {
-    const ALL: [SettingsField; 8] = [
-        SettingsField::Theme,
+    const CUSTOM_COLORS: [SettingsField; 6] = [
+        SettingsField::CustomOk,
+        SettingsField::CustomError,
+        SettingsField::CustomPending,
+        SettingsField::CustomRunning,
+        SettingsField::CustomParent,
+        SettingsField::CustomBorder,
+    ];
+
+    const COMMON: [SettingsField; 7] = [
         SettingsField::DefaultMode,
         SettingsField::FollowSymlinks,
         SettingsField::ShowFiles,
@@ -169,24 +252,123 @@ impl SettingsField {
         SettingsField::HashCachePath,
     ];
 
-    fn from_index(index: usize) -> Self {
-        Self::ALL
-            .get(index)
-            .copied()
-            .unwrap_or(SettingsField::Theme)
+    /// Fields shown for the current draft: the six hex-color rows only
+    /// appear while the theme is Custom.
+    fn visible(draft: &AppSettings) -> Vec<SettingsField> {
+        let mut fields = vec![SettingsField::Theme];
+        if draft.theme == ThemePreset::Custom {
+            fields.extend(Self::CUSTOM_COLORS);
+        }
+        fields.extend(Self::COMMON);
+        fields
     }
 
     fn label(self) -> &'static str {
         match self {
-            SettingsField::Theme => "Theme Colors",
-            SettingsField::DefaultMode => "Default Scan Mode",
-            SettingsField::FollowSymlinks => "Default Follow Symlinks",
-            SettingsField::ShowFiles => "Default Show Files",
-            SettingsField::DeletePermanent => "Default Permanent Delete",
-            SettingsField::DuplicateMinSize => "Default Duplicate Min Size (bytes)",
-            SettingsField::ScanCachePath => "Scan Cache Path",
-            SettingsField::HashCachePath => "Hash Cache Path",
+            SettingsField::Theme => "Theme",
+            SettingsField::CustomOk => "Color: done",
+            SettingsField::CustomError => "Color: error",
+            SettingsField::CustomPending => "Color: pending",
+            SettingsField::CustomRunning => "Color: running",
+            SettingsField::CustomParent => "Color: parent",
+            SettingsField::CustomBorder => "Color: border",
+            SettingsField::DefaultMode => "Scan mode",
+            SettingsField::FollowSymlinks => "Follow symlinks",
+            SettingsField::ShowFiles => "Show files",
+            SettingsField::DeletePermanent => "Permanent delete",
+            SettingsField::DuplicateMinSize => "Duplicate min size",
+            SettingsField::ScanCachePath => "Scan cache path",
+            SettingsField::HashCachePath => "Hash cache path",
         }
+    }
+
+    /// Section heading rendered above the first field of each group.
+    fn section(self) -> &'static str {
+        match self {
+            SettingsField::Theme
+            | SettingsField::CustomOk
+            | SettingsField::CustomError
+            | SettingsField::CustomPending
+            | SettingsField::CustomRunning
+            | SettingsField::CustomParent
+            | SettingsField::CustomBorder => "Appearance",
+            SettingsField::DefaultMode | SettingsField::FollowSymlinks | SettingsField::ShowFiles => {
+                "Scanning"
+            }
+            SettingsField::DeletePermanent => "Deletion",
+            SettingsField::DuplicateMinSize => "Duplicates",
+            SettingsField::ScanCachePath | SettingsField::HashCachePath => "Cache locations",
+        }
+    }
+
+    /// One-line explanation shown for the selected field.
+    fn description(self) -> &'static str {
+        match self {
+            SettingsField::Theme => {
+                "Color palette. Previewed live. Custom unlocks per-color hex fields below."
+            }
+            SettingsField::CustomOk
+            | SettingsField::CustomError
+            | SettingsField::CustomPending
+            | SettingsField::CustomRunning
+            | SettingsField::CustomParent
+            | SettingsField::CustomBorder => {
+                "Hex color like #a6e3a1 (or #fff). Enter types a value; previewed live."
+            }
+            SettingsField::DefaultMode => {
+                "Fast counts logical sizes only; Accurate adds on-disk allocation and ADS (slower)."
+            }
+            SettingsField::FollowSymlinks => {
+                "Descend into directory symlinks and junctions. Cycles are detected and skipped."
+            }
+            SettingsField::ShowFiles => "List individual files instead of one combined [files] row.",
+            SettingsField::DeletePermanent => {
+                "When ON, Del/x bypasses the Recycle Bin. It still asks for confirmation."
+            }
+            SettingsField::DuplicateMinSize => {
+                "Files smaller than this are ignored by --duplicates. Enter types an exact byte count."
+            }
+            SettingsField::ScanCachePath => {
+                "File for the per-file attribute cache. Empty = auto (%LOCALAPPDATA%\\ntscan)."
+            }
+            SettingsField::HashCachePath => {
+                "File for the duplicate-hash cache. Empty = auto (%LOCALAPPDATA%\\ntscan)."
+            }
+        }
+    }
+
+    /// Rendered value for the field, shared by the popup and change markers.
+    fn display_value(self, settings: &AppSettings) -> String {
+        match self {
+            SettingsField::Theme => settings.theme.label().to_string(),
+            SettingsField::CustomOk => format_hex_color(settings.custom_colors.ok),
+            SettingsField::CustomError => format_hex_color(settings.custom_colors.error),
+            SettingsField::CustomPending => format_hex_color(settings.custom_colors.pending),
+            SettingsField::CustomRunning => format_hex_color(settings.custom_colors.running),
+            SettingsField::CustomParent => format_hex_color(settings.custom_colors.parent),
+            SettingsField::CustomBorder => format_hex_color(settings.custom_colors.border),
+            SettingsField::DefaultMode => settings.default_mode.label().to_string(),
+            SettingsField::FollowSymlinks => bool_label(settings.default_follow_symlinks).to_string(),
+            SettingsField::ShowFiles => bool_label(settings.default_show_files).to_string(),
+            SettingsField::DeletePermanent => {
+                bool_label(settings.default_delete_permanent).to_string()
+            }
+            SettingsField::DuplicateMinSize => format_size(settings.min_duplicate_size),
+            SettingsField::ScanCachePath => settings
+                .scan_cache_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from("(auto)")),
+            SettingsField::HashCachePath => settings
+                .hash_cache_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| String::from("(auto)")),
+        }
+    }
+
+    fn is_changed(self, draft: &AppSettings, saved: &AppSettings) -> bool {
+        self.display_value(draft) != self.display_value(saved)
     }
 
     fn is_text(self) -> bool {
@@ -195,8 +377,23 @@ impl SettingsField {
             SettingsField::DuplicateMinSize
                 | SettingsField::ScanCachePath
                 | SettingsField::HashCachePath
+                | SettingsField::CustomOk
+                | SettingsField::CustomError
+                | SettingsField::CustomPending
+                | SettingsField::CustomRunning
+                | SettingsField::CustomParent
+                | SettingsField::CustomBorder
         )
     }
+}
+
+/// True when the change can't be applied to the running session and needs a
+/// fresh scan (different cache, options that alter traversal or output).
+fn settings_require_restart(a: &AppSettings, b: &AppSettings) -> bool {
+    a.default_mode != b.default_mode
+        || a.default_follow_symlinks != b.default_follow_symlinks
+        || a.default_show_files != b.default_show_files
+        || a.scan_cache_path != b.scan_cache_path
 }
 
 #[derive(Clone)]
@@ -274,12 +471,9 @@ impl RowData {
         };
         let (modified_sort, modified_text) = format_modified(entry.modified);
         let percent_text = if total_logical > 0 {
-            format!(
-                "{:.2}",
-                (entry.logical_size as f64 / total_logical as f64) * 100.0
-            )
+            percent_bar((entry.logical_size as f64 / total_logical as f64) * 100.0)
         } else {
-            "0.00".to_string()
+            percent_bar(0.0)
         };
 
         RowData {
@@ -299,23 +493,30 @@ impl RowData {
         }
     }
 
-    fn into_row(self, highlighted: bool) -> Row<'static> {
+    /// Builds the table row. `show_accurate` controls whether the
+    /// Allocated/ADS columns exist at all — Fast mode never fills them, so
+    /// the table drops them instead of printing dashes.
+    fn into_row(self, highlighted: bool, show_accurate: bool) -> Row<'static> {
         let highlight_style = Style::default().add_modifier(Modifier::REVERSED);
         let style = if highlighted {
             self.style.patch(highlight_style)
         } else {
             self.style
         };
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(self.name),
             Cell::from(self.type_label),
             Cell::from(self.status),
             Cell::from(self.logical_text),
-            Cell::from(self.allocated_text),
-            Cell::from(self.modified_text),
-            Cell::from(self.ads_text),
-            Cell::from(self.percent_text),
-        ])
-        .style(style)
+        ];
+        if show_accurate {
+            cells.push(Cell::from(self.allocated_text));
+        }
+        cells.push(Cell::from(self.modified_text));
+        if show_accurate {
+            cells.push(Cell::from(self.ads_text));
+        }
+        cells.push(Cell::from(self.percent_text));
+        Row::new(cells).style(style)
     }
 }

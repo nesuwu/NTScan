@@ -78,28 +78,36 @@ pub struct DirScanCache {
     shards: Vec<Mutex<HashMap<String, Slot>>>,
     dirty: Arc<AtomicBool>,
     file_path: PathBuf,
+    loaded_entries: usize,
+    load_failed: bool,
 }
 
 impl Default for DirScanCache {
     fn default() -> Self {
-        if let Some(raw) = std::env::var_os(DIR_CACHE_ENV_PATH) {
-            let path = PathBuf::from(&raw);
-            if !path.as_os_str().is_empty() {
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                return Self::new(path);
-            }
-        }
-        if let Ok(local) = std::env::var("LOCALAPPDATA") {
-            let mut dir = PathBuf::from(local);
-            dir.push("ntscan");
-            if fs::create_dir_all(&dir).is_ok() {
-                return Self::new(dir.join("dir_scan.redb"));
-            }
-        }
-        Self::new(std::env::temp_dir().join("ntscan_dir_scan.redb"))
+        Self::new(default_dir_cache_path())
     }
+}
+
+/// Resolves the directory-cache location (env override, then
+/// `%LOCALAPPDATA%`, then the system temp directory).
+pub(crate) fn default_dir_cache_path() -> PathBuf {
+    if let Some(raw) = std::env::var_os(DIR_CACHE_ENV_PATH) {
+        let path = PathBuf::from(&raw);
+        if !path.as_os_str().is_empty() {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            return path;
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let mut dir = PathBuf::from(local);
+        dir.push("ntscan");
+        if fs::create_dir_all(&dir).is_ok() {
+            return dir.join("dir_scan.redb");
+        }
+    }
+    std::env::temp_dir().join("ntscan_dir_scan.redb")
 }
 
 impl DirScanCache {
@@ -108,15 +116,38 @@ impl DirScanCache {
             .map(|_| Mutex::new(HashMap::new()))
             .collect();
 
-        if let Ok(db) = Database::open(&path) {
-            let _ = load(&db, &shards);
+        let mut load_failed = false;
+        match Database::open(&path) {
+            Ok(db) => {
+                if load(&db, &shards).is_err() {
+                    load_failed = true;
+                }
+            }
+            // A missing file is the normal first run; anything else
+            // (corrupt, locked, unreadable) is worth surfacing.
+            Err(_) => load_failed = path.exists(),
         }
+
+        let loaded_entries = shards.iter().map(|shard| shard.lock().unwrap().len()).sum();
 
         Self {
             shards,
             dirty: Arc::new(AtomicBool::new(false)),
             file_path: path,
+            loaded_entries,
+            load_failed,
         }
+    }
+
+    /// Number of entries read from disk at construction. `0` means a cold
+    /// cache — the first scan of this machine/target set.
+    pub fn loaded_entries(&self) -> usize {
+        self.loaded_entries
+    }
+
+    /// True when a cache file existed but could not be read at construction.
+    pub fn load_failed(&self) -> bool {
+        self.load_failed
     }
 
     /// Returns cached totals if the directory mtime matches.
@@ -269,13 +300,35 @@ fn write_snapshot(db: &Database, snapshot: &[(String, Slot)]) -> io::Result<()> 
         .map_err(|e| io::Error::other(e.to_string()))
 }
 
-fn open_or_recreate(path: &Path) -> io::Result<Database> {
+/// Opens (or creates) a redb database for writing. Recreates the file only
+/// when it is provably unusable — a database locked by a second ntscan
+/// instance or hit by a transient I/O error must not be destroyed.
+pub(crate) fn open_or_recreate(path: &Path) -> io::Result<Database> {
+    use redb::{DatabaseError, StorageError};
+
+    // A file that isn't a redb database at all surfaces as Io(InvalidData),
+    // not Corrupted. A database locked by another instance surfaces as
+    // Io(WouldBlock) and must fall through to the preserve branch.
+    let recreate = |err: &DatabaseError| {
+        matches!(
+            err,
+            DatabaseError::Storage(StorageError::Corrupted(_))
+                | DatabaseError::UpgradeRequired(_)
+                | DatabaseError::RepairAborted
+        ) || matches!(
+            err,
+            DatabaseError::Storage(StorageError::Io(io_err))
+                if io_err.kind() == io::ErrorKind::InvalidData
+        )
+    };
+
     match Database::create(path) {
         Ok(db) => Ok(db),
-        Err(_) => {
-            let _ = fs::remove_file(path);
+        Err(err) if recreate(&err) => {
+            fs::remove_file(path)?;
             Database::create(path).map_err(|e| io::Error::other(e.to_string()))
         }
+        Err(err) => Err(io::Error::other(err.to_string())),
     }
 }
 
@@ -318,6 +371,38 @@ mod tests {
         // Different mtime → miss
         let t2 = t1 + std::time::Duration::from_secs(1);
         assert!(cache.get(&target, Some(t2), ScanMode::Fast).is_none());
+    }
+
+    #[test]
+    fn missing_file_is_not_a_load_failure() {
+        let dir = tempdir().unwrap();
+        let cache = DirScanCache::new(dir.path().join("does_not_exist.redb"));
+        assert!(!cache.load_failed());
+        assert_eq!(cache.loaded_entries(), 0);
+    }
+
+    #[test]
+    fn corrupt_file_flags_failure_and_save_recovers() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("corrupt.redb");
+        fs::write(&cache_path, b"this is not a redb database").unwrap();
+
+        let cache = DirScanCache::new(cache_path.clone());
+        assert!(cache.load_failed(), "corrupt file should flag load failure");
+        assert_eq!(cache.loaded_entries(), 0);
+
+        // Saving must recreate the corrupt file rather than erroring out.
+        let target = dir.path().join("foo");
+        let t = SystemTime::now();
+        cache.insert(&target, Some(t), 123, None, false);
+        cache
+            .save()
+            .expect("save should recreate a corrupt cache file");
+
+        let reloaded = DirScanCache::new(cache_path);
+        assert!(!reloaded.load_failed());
+        assert_eq!(reloaded.loaded_entries(), 1);
+        assert!(reloaded.get(&target, Some(t), ScanMode::Fast).is_some());
     }
 
     #[test]

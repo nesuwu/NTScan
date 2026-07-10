@@ -52,6 +52,15 @@ pub struct Args {
         help = "Permanently delete files/folders (skipping trash) when using deletion features"
     )]
     pub delete_permanent: bool,
+
+    #[arg(long, help = "Replay the interactive tutorial (sample data)")]
+    pub tutorial: bool,
+
+    #[arg(
+        long,
+        help = "Delete all NTScan caches (scan, directory, duplicate-hash) and exit"
+    )]
+    pub purge: bool,
 }
 
 impl Args {

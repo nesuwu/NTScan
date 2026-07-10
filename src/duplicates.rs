@@ -150,8 +150,7 @@ fn open_or_recreate_hash_db(path: &Path) -> std::io::Result<Database> {
         Ok(db) => Ok(db),
         Err(_) => {
             let _ = fs::remove_file(path);
-            Database::create(path)
-                .map_err(|e| std::io::Error::other(e.to_string()))
+            Database::create(path).map_err(|e| std::io::Error::other(e.to_string()))
         }
     }
 }
@@ -364,7 +363,7 @@ fn hash_file_sha256(path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn resolve_hash_cache_path() -> PathBuf {
+pub(crate) fn resolve_hash_cache_path() -> PathBuf {
     if let Some(path) = std::env::var_os(HASH_CACHE_ENV_PATH) {
         let path = PathBuf::from(path);
         if !path.as_os_str().is_empty() {

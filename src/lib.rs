@@ -1,3 +1,8 @@
+// clippy 1.95 false positive: fires on scanner's WIDE_BUF thread_local even
+// though its initializer already uses `const { }`. The attribute can't sit
+// on the macro invocation itself (unused_attributes), so it lives here.
+#![allow(clippy::missing_const_for_thread_local)]
+
 pub mod args;
 pub mod cache;
 pub mod context;

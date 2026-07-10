@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::cache::DirScanCache;
-use crate::model::{ErrorStats, ProgressEvent, ScanErrorKind, ScanOptions, SkipStats};
+use crate::model::{ErrorStats, ProgressEvent, ScanErrorKind, ScanMode, ScanOptions, SkipStats};
 
 const CACHE_ENV_PATH: &str = "NTSCAN_CACHE_PATH";
 const SCAN_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("scan_attributes_v2");
@@ -94,28 +94,12 @@ pub struct ScanCache {
     shards: Vec<Mutex<HashMap<String, CachedAttributes>>>,
     dirty: Arc<AtomicBool>,
     file_path: PathBuf,
+    load_failed: bool,
 }
 
 impl Default for ScanCache {
     fn default() -> Self {
-        if let Some(path) = std::env::var_os(CACHE_ENV_PATH) {
-            let path = PathBuf::from(path);
-            if !path.as_os_str().is_empty() {
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                return Self::new(path);
-            }
-        }
-
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let mut dir = PathBuf::from(local_app_data);
-            dir.push("ntscan");
-            if fs::create_dir_all(&dir).is_ok() {
-                return Self::new(dir.join("scan.redb"));
-            }
-        }
-        Self::new(std::env::temp_dir().join("ntscan_scan.redb"))
+        Self::new(Self::default_path())
     }
 }
 
@@ -124,19 +108,81 @@ impl ScanCache {
     /// closes the database handle. Every subsequent lookup is served from the
     /// in-memory shards with no disk access.
     pub fn new(path: PathBuf) -> Self {
+        Self::with_load(path, true)
+    }
+
+    /// Records the cache path but skips loading the database. Used for Fast
+    /// mode, which never reads file attributes — loading a large accurate
+    /// cache there only delays startup. Saving stays safe: the dirty flag is
+    /// only set by inserts, so `save()` is a no-op and cannot clobber the
+    /// on-disk cache.
+    pub fn unloaded(path: PathBuf) -> Self {
+        Self::with_load(path, false)
+    }
+
+    /// Picks the loading strategy for the given scan mode: Fast mode skips
+    /// the load entirely, Accurate mode reads the cache into RAM.
+    pub fn for_mode(path: Option<PathBuf>, mode: ScanMode) -> Self {
+        let path = path.unwrap_or_else(Self::default_path);
+        match mode {
+            ScanMode::Fast => Self::unloaded(path),
+            ScanMode::Accurate => Self::new(path),
+        }
+    }
+
+    fn with_load(path: PathBuf, load: bool) -> Self {
         let shards: Vec<Mutex<HashMap<String, CachedAttributes>>> =
             (0..256).map(|_| Mutex::new(HashMap::new())).collect();
 
-        if let Ok(db) = Database::open(&path) {
-            let _ = load_into_shards(&db, &shards);
-            // db handle is dropped here — file lock released until save()
+        let mut load_failed = false;
+        if load {
+            match Database::open(&path) {
+                Ok(db) => {
+                    if load_into_shards(&db, &shards).is_err() {
+                        load_failed = true;
+                    }
+                    // db handle is dropped here — file lock released until save()
+                }
+                // A missing file is the normal first run; anything else
+                // (corrupt, locked, unreadable) is worth surfacing.
+                Err(_) => load_failed = path.exists(),
+            }
         }
 
         Self {
             shards,
             dirty: Arc::new(AtomicBool::new(false)),
             file_path: path,
+            load_failed,
         }
+    }
+
+    /// True when a cache file existed but could not be read at construction.
+    pub fn load_failed(&self) -> bool {
+        self.load_failed
+    }
+
+    /// Resolves the default on-disk location (env override, then
+    /// `%LOCALAPPDATA%`, then the system temp directory).
+    pub(crate) fn default_path() -> PathBuf {
+        if let Some(path) = std::env::var_os(CACHE_ENV_PATH) {
+            let path = PathBuf::from(path);
+            if !path.as_os_str().is_empty() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                return path;
+            }
+        }
+
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let mut dir = PathBuf::from(local_app_data);
+            dir.push("ntscan");
+            if fs::create_dir_all(&dir).is_ok() {
+                return dir.join("scan.redb");
+            }
+        }
+        std::env::temp_dir().join("ntscan_scan.redb")
     }
 
     /// Retrieves cached attributes if the file size and modification time match.
@@ -217,7 +263,7 @@ impl ScanCache {
             snapshot.extend(guard.iter().map(|(k, v)| (k.clone(), *v)));
         }
 
-        let db = open_or_recreate_db(&self.file_path)?;
+        let db = crate::cache::open_or_recreate(&self.file_path)?;
         write_snapshot(&db, &snapshot)?;
         self.dirty.store(false, AtomicOrdering::Relaxed);
         Ok(())
@@ -290,18 +336,6 @@ fn write_snapshot(db: &Database, snapshot: &[(String, CachedAttributes)]) -> io:
     write_txn
         .commit()
         .map_err(|e| io::Error::other(e.to_string()))
-}
-
-/// Opens or creates the redb database. If the file exists but is corrupt/old-format,
-/// removes it and starts fresh.
-fn open_or_recreate_db(path: &Path) -> io::Result<Database> {
-    match Database::create(path) {
-        Ok(db) => Ok(db),
-        Err(_) => {
-            let _ = fs::remove_file(path);
-            Database::create(path).map_err(|e| io::Error::other(e.to_string()))
-        }
-    }
 }
 
 fn shard_index(num_shards: usize, key: &str) -> usize {
@@ -771,5 +805,48 @@ mod tests {
             cache2.shards[idx].lock().unwrap().contains_key(&key),
             "loaded cache should contain the saved entry"
         );
+    }
+
+    #[test]
+    fn missing_file_is_not_a_load_failure() {
+        let dir = tempdir().unwrap();
+        let cache = ScanCache::new(dir.path().join("does_not_exist.redb"));
+        assert!(!cache.load_failed());
+    }
+
+    #[test]
+    fn corrupt_file_flags_failure_and_save_recovers() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("corrupt.redb");
+        fs::write(&cache_path, b"this is not a redb database").unwrap();
+
+        let cache = ScanCache::new(cache_path.clone());
+        assert!(cache.load_failed(), "corrupt file should flag load failure");
+
+        // Saving must recreate the corrupt file rather than erroring out.
+        cache.insert_attributes(
+            dir.path().join("item.txt"),
+            Some(SystemTime::now()),
+            1024,
+            2048,
+            None,
+        );
+        cache
+            .save()
+            .expect("save should recreate a corrupt cache file");
+
+        let reloaded = ScanCache::new(cache_path);
+        assert!(!reloaded.load_failed());
+    }
+
+    #[test]
+    fn unloaded_cache_never_flags_load_failure() {
+        let dir = tempdir().unwrap();
+        let cache_path = dir.path().join("corrupt.redb");
+        fs::write(&cache_path, b"this is not a redb database").unwrap();
+
+        // Fast mode never reads the file, so it can't know or care.
+        let cache = ScanCache::unloaded(cache_path);
+        assert!(!cache.load_failed());
     }
 }

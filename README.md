@@ -49,6 +49,8 @@ ntscan [OPTIONS] [TARGET]
 | `--file` | List individual files, not just directory totals. |
 | `--delete-permanent` | Deletion features skip the Recycle Bin. Items are unrecoverable. |
 | `--debug` | Print only the final table; skip the TUI. |
+| `--tutorial` | Replay the interactive tutorial (runs automatically on first launch). |
+| `--purge` | Delete all NTScan caches (scan, directory, duplicate-hash) and exit. Settings are kept. |
 
 ### Examples
 
@@ -74,17 +76,33 @@ Saved settings persist to `%LOCALAPPDATA%\ntscan\settings.conf`, or
 
 ## TUI Keys
 
+On first launch the TUI opens a short interactive tutorial on sample data —
+every key works exactly as in a real scan, but nothing on disk is touched.
+`Esc` skips it; `ntscan --tutorial` replays it.
+
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Move selection |
+| `Up`/`k`, `Down`/`j` | Move selection |
+| `Right` / `l` / `Enter` | Open selected directory |
+| `Left` / `h` / `Backspace` | Go back |
 | `PageUp` / `PageDown` | Scroll one page |
 | `Home` / `End` | First / last entry |
-| `s` | Cycle sort: Name, Size, Date |
-| `g` | Open settings panel |
+| `n` / `s` / `d` | Sort by name / size / date; same key again reverses |
+| `Del` / `x` | Delete selected (asks for confirmation) |
+| `F2` / `g` | Open settings panel |
+| `?` / `F1` | Help overlay |
 | `q` / `Esc` | Quit (`Ctrl+C` cancels the scan) |
 
-In the settings panel: `Up`/`Down` select, `Left`/`Right` toggle, `Enter`
-edits a text field, `Ctrl+S` saves persistent defaults.
+In the settings panel: `Up`/`Down` (or `k`/`j`) select, `Left`/`Right` (or
+`h`/`l`) change the value, `Enter` types an exact value into text fields,
+`z` undoes all edits, and `Esc` saves and closes. Changed fields are marked
+with `*`; theme changes preview live. Only scan-affecting changes trigger a
+rescan.
+
+Setting the theme to `Custom` reveals six hex color fields (done, error,
+pending, running, parent, border). Values accept `#rrggbb` or `#rgb` and
+preview live; they persist in `settings.conf` as `custom_*` keys. Truecolor
+terminal (Windows Terminal, etc.) required for exact colors.
 
 ## Library / DLL
 

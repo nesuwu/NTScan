@@ -18,9 +18,10 @@ use windows::Win32::Foundation::{
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FIND_FIRST_EX_LARGE_FETCH, FileStandardInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch,
-    FindFirstFileExW, FindFirstStreamW, FindNextFileW, FindNextStreamW, GetCompressedFileSizeW,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FIND_FIRST_EX_LARGE_FETCH, FileIdBothDirectoryInfo,
+    FileStandardInfo, FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
+    FindFirstStreamW, FindNextFileW, FindNextStreamW, GetCompressedFileSizeW,
     GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING, STREAM_INFO_LEVELS,
     WIN32_FIND_DATAW, WIN32_FIND_STREAM_DATA,
 };
@@ -150,7 +151,7 @@ fn scan_directory_inner(path: &Path, context: &ScanContext) -> Result<DirectoryR
     let mut precomputed: Vec<EntryReport> = Vec::new();
 
     rayon::scope(|s| -> Result<()> {
-        let iter = WinDirIter::new(path)?;
+        let iter = DirIter::new(path)?;
         for (index, raw) in iter.enumerate() {
             if index % CANCEL_CHECK_INTERVAL == 0 {
                 check_cancelled(context)?;
@@ -281,7 +282,7 @@ pub fn prepare_directory_plan(path: &Path, context: &ScanContext) -> Result<Dire
     let mut precomputed_entries = Vec::new();
     let mut pending_files: Vec<PendingFile> = Vec::new();
 
-    let iter = WinDirIter::new(path)?;
+    let iter = DirIter::new(path)?;
     for (index, raw) in iter.enumerate() {
         if index % CANCEL_CHECK_INTERVAL == 0 {
             check_cancelled(context)?;
@@ -354,14 +355,30 @@ fn with_wide_search<R>(dir: &Path, f: impl FnOnce(*const u16) -> R) -> R {
     })
 }
 
-/// One raw directory entry as returned by `FindFirstFileExW`/`FindNextFileW`,
-/// already carrying the attributes, size and mtime so no per-entry `stat`
-/// round-trip is needed (Change 3).
+/// Hard-link identity knowledge for one enumerated file (Change 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileIds {
+    /// `(volume_serial, 64-bit file id)` came batched with the directory
+    /// listing — dedup needs no per-file syscalls.
+    Known(u64, u64),
+    /// Handle enumeration worked but the filesystem reports no file id
+    /// (e.g. FAT). Such filesystems have no hardlinks; treat as unique.
+    NoneOnVolume,
+    /// Find-based enumeration — resolve identity per file as before.
+    Unknown,
+}
+
+/// One raw directory entry, already carrying the attributes, size and mtime
+/// so no per-entry `stat` round-trip is needed (Change 3). The handle-based
+/// iterator (Change 8) additionally fills `allocated` and `ids`.
 struct RawEntry {
     name: String,
     attributes: u32,
     len: u64,
     modified: Option<SystemTime>,
+    /// `AllocationSize` from the directory index; `None` on the find path.
+    allocated: Option<u64>,
+    ids: FileIds,
 }
 
 /// Size + mtime of a classified file, carried into Phase 2 in place of a
@@ -369,6 +386,9 @@ struct RawEntry {
 struct EntryInfo {
     len: u64,
     modified: Option<SystemTime>,
+    /// `AllocationSize` from the directory index; `None` on the find path.
+    allocated: Option<u64>,
+    ids: FileIds,
 }
 
 /// Directory iterator using `FindFirstFileExW` with `FindExInfoBasic`
@@ -438,6 +458,8 @@ impl Iterator for WinDirIter {
                 attributes: self.data.dwFileAttributes,
                 len,
                 modified: filetime_to_systemtime(self.data.ftLastWriteTime),
+                allocated: None,
+                ids: FileIds::Unknown,
             }));
         }
     }
@@ -451,13 +473,200 @@ impl Drop for WinDirIter {
     }
 }
 
+// ── Change 8: FileId-batched directory enumeration ──────────────────────
+//
+// `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)` returns, per entry
+// and batched in one buffer: name, attributes, sizes, mtime, AllocationSize
+// and the 64-bit FileId. That removes the per-file `CreateFileW` that Fast
+// mode paid purely for hardlink dedup, and the identity handle +
+// `GetCompressedFileSizeW` that Accurate mode paid per file. Filesystems
+// that don't support the info class fall back to `WinDirIter` per directory.
+
+/// Buffer size for one `FileIdBothDirectoryInfo` batch.
+const DIR_ENUM_BUF_LEN: usize = 64 * 1024;
+
+// `FILE_ID_BOTH_DIR_INFO` field offsets (natural layout; asserted against
+// the real struct in the tests below).
+const IDBOTH_NEXT_OFFSET: usize = 0;
+const IDBOTH_LAST_WRITE: usize = 24;
+const IDBOTH_END_OF_FILE: usize = 40;
+const IDBOTH_ALLOCATION: usize = 48;
+const IDBOTH_ATTRIBUTES: usize = 56;
+const IDBOTH_NAME_LEN: usize = 60;
+const IDBOTH_FILE_ID: usize = 96;
+const IDBOTH_NAME: usize = 104;
+
+/// Parses one `FileIdBothDirectoryInfo` batch buffer into raw entries,
+/// skipping `.`/`..`. Pure byte parsing — no Win32 — so it unit-tests
+/// anywhere. Malformed records are skipped defensively; the chain ends at
+/// `NextEntryOffset == 0` or the buffer edge.
+fn parse_id_both_dir_buffer(buf: &[u8], vol_serial: Option<u64>, out: &mut Vec<RawEntry>) {
+    let mut base = 0usize;
+    loop {
+        if base + IDBOTH_NAME > buf.len() {
+            return;
+        }
+        let u32_at =
+            |at: usize| u32::from_le_bytes(buf[base + at..base + at + 4].try_into().unwrap());
+        let u64_at =
+            |at: usize| u64::from_le_bytes(buf[base + at..base + at + 8].try_into().unwrap());
+
+        let next = u32_at(IDBOTH_NEXT_OFFSET) as usize;
+        let name_len = u32_at(IDBOTH_NAME_LEN) as usize;
+        let name_end = base + IDBOTH_NAME + name_len;
+        if name_len.is_multiple_of(2) && name_end <= buf.len() {
+            let wide: Vec<u16> = buf[base + IDBOTH_NAME..name_end]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let name = String::from_utf16_lossy(&wide);
+            if name != "." && name != ".." {
+                let file_id = u64_at(IDBOTH_FILE_ID);
+                let ids = match (vol_serial, file_id) {
+                    (Some(vol), id) if id != 0 => FileIds::Known(vol, id),
+                    (Some(_), _) => FileIds::NoneOnVolume,
+                    (None, _) => FileIds::Unknown,
+                };
+                out.push(RawEntry {
+                    name,
+                    attributes: u32_at(IDBOTH_ATTRIBUTES),
+                    len: u64_at(IDBOTH_END_OF_FILE),
+                    modified: ticks_to_systemtime(u64_at(IDBOTH_LAST_WRITE)),
+                    allocated: Some(u64_at(IDBOTH_ALLOCATION)),
+                    ids,
+                });
+            }
+        }
+        if next == 0 {
+            return;
+        }
+        base += next;
+    }
+}
+
+/// Directory iterator over `FileIdBothDirectoryInfo` batches (Change 8).
+struct DirHandleIter {
+    handle: HANDLE,
+    vol_serial: Option<u64>,
+    buf: Vec<u8>,
+    batch: std::vec::IntoIter<RawEntry>,
+    done: bool,
+}
+
+impl DirHandleIter {
+    /// Opens the directory and probes the first batch. `None` means the
+    /// caller should fall back to [`WinDirIter`] (open failed, or the
+    /// filesystem doesn't support the info class).
+    fn new(dir: &Path) -> Option<Self> {
+        let handle = open_path_handle(dir, FILE_LIST_DIRECTORY.0, FILE_FLAG_BACKUP_SEMANTICS)?;
+        let mut iter = Self {
+            handle,
+            vol_serial: read_identity(handle).map(|(vol, _)| vol),
+            buf: vec![0u8; DIR_ENUM_BUF_LEN],
+            batch: Vec::new().into_iter(),
+            done: false,
+        };
+        match iter.fill() {
+            Ok(_) => Some(iter),
+            Err(_) => None,
+        }
+    }
+
+    /// Fetches and parses the next batch. `Ok(false)` = enumeration done.
+    fn fill(&mut self) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        match unsafe {
+            GetFileInformationByHandleEx(
+                self.handle,
+                FileIdBothDirectoryInfo,
+                self.buf.as_mut_ptr() as *mut c_void,
+                self.buf.len() as u32,
+            )
+        } {
+            Ok(()) => {
+                let mut entries = Vec::new();
+                parse_id_both_dir_buffer(&self.buf, self.vol_serial, &mut entries);
+                self.batch = entries.into_iter();
+                Ok(true)
+            }
+            Err(err) if err.code() == hresult_from_win32(ERROR_NO_MORE_FILES.0) => {
+                self.done = true;
+                Ok(false)
+            }
+            Err(err) => Err(anyhow!("FileIdBothDirectoryInfo query failed: {}", err)),
+        }
+    }
+}
+
+impl Iterator for DirHandleIter {
+    type Item = Result<RawEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(entry) = self.batch.next() {
+                return Some(Ok(entry));
+            }
+            match self.fill() {
+                Ok(true) => continue,
+                Ok(false) => return None,
+                Err(err) => {
+                    self.done = true;
+                    return Some(Err(err));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for DirHandleIter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Per-directory enumeration source: handle-batched where supported,
+/// find-based everywhere else. The find variant is boxed because
+/// `WIN32_FIND_DATAW` is ~600 bytes.
+enum DirIter {
+    Handle(DirHandleIter),
+    Find(Box<WinDirIter>),
+}
+
+impl DirIter {
+    fn new(dir: &Path) -> Result<Self> {
+        if let Some(iter) = DirHandleIter::new(dir) {
+            return Ok(Self::Handle(iter));
+        }
+        Ok(Self::Find(Box::new(WinDirIter::new(dir)?)))
+    }
+}
+
+impl Iterator for DirIter {
+    type Item = Result<RawEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Handle(iter) => iter.next(),
+            Self::Find(iter) => iter.next(),
+        }
+    }
+}
+
 fn wide_name(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }
 
 fn filetime_to_systemtime(ft: FILETIME) -> Option<SystemTime> {
-    let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+    ticks_to_systemtime(((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64))
+}
+
+/// Converts 100ns ticks since 1601-01-01 into a `SystemTime`.
+fn ticks_to_systemtime(ticks: u64) -> Option<SystemTime> {
     if ticks == 0 {
         return None;
     }
@@ -486,7 +695,7 @@ fn classify(raw: RawEntry, parent: &Path, context: &ScanContext) -> Classified {
     let path = parent.join(&raw.name);
     let is_symlink = (raw.attributes & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
 
-    let (len, modified, is_dir) = if is_symlink {
+    let (len, modified, is_dir, allocated, ids) = if is_symlink {
         if !context.options().follow_symlinks {
             context.record_skipped();
             if context.has_progress() {
@@ -503,7 +712,15 @@ fn classify(raw: RawEntry, parent: &Path, context: &ScanContext) -> Classified {
             ));
         }
         match fs::metadata(&path) {
-            Ok(meta) => (meta.len(), meta.modified().ok(), meta.is_dir()),
+            // Metadata describes the symlink target, so the batched
+            // allocation/identity of the link entry don't apply.
+            Ok(meta) => (
+                meta.len(),
+                meta.modified().ok(),
+                meta.is_dir(),
+                None,
+                FileIds::Unknown,
+            ),
             Err(err) => {
                 context.record_error(classify_io_error(&err));
                 if context.has_progress() {
@@ -522,7 +739,7 @@ fn classify(raw: RawEntry, parent: &Path, context: &ScanContext) -> Classified {
         }
     } else {
         let is_dir = (raw.attributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
-        (raw.len, raw.modified, is_dir)
+        (raw.len, raw.modified, is_dir, raw.allocated, raw.ids)
     };
 
     if is_dir {
@@ -536,7 +753,12 @@ fn classify(raw: RawEntry, parent: &Path, context: &ScanContext) -> Classified {
     Classified::File(PendingFile {
         name: raw.name,
         path,
-        info: EntryInfo { len, modified },
+        info: EntryInfo {
+            len,
+            modified,
+            allocated,
+            ids,
+        },
     })
 }
 
@@ -613,15 +835,22 @@ fn process_pending_files(
 fn process_single_file(file: &PendingFile, context: &ScanContext) -> Result<FileResult> {
     check_cancelled(context)?;
 
-    let (logical, allocated, allocated_complete, ids, ads) =
+    let (logical, allocated, allocated_complete, handle_ids, ads) =
         file_metrics(&file.path, &file.info, context)?;
 
-    // Change 2: in Accurate mode the identity was already read from the one
-    // handle file_metrics opened, so dedup needs no extra CreateFileW.
-    let (is_first_logical, is_first_alloc) = if context.options().mode == ScanMode::Accurate {
-        context.mark_file_unique_by_id(ids, &file.path)
-    } else {
-        context.mark_file_unique(&file.path)
+    // Change 8: prefer the identity that came batched with the directory
+    // enumeration — no per-file syscalls. Fall back to the per-file
+    // identity paths (Change 2) only for find-based entries.
+    let (is_first_logical, is_first_alloc) = match file.info.ids {
+        FileIds::Known(vol, id) => context.mark_file_unique_by_id(Some((vol, id)), &file.path),
+        FileIds::NoneOnVolume => (true, true),
+        FileIds::Unknown => {
+            if context.options().mode == ScanMode::Accurate {
+                context.mark_file_unique_by_id(handle_ids, &file.path)
+            } else {
+                context.mark_file_unique(&file.path)
+            }
+        }
     };
 
     let accounted_logical = if is_first_logical { logical } else { 0 };
@@ -787,6 +1016,15 @@ impl Drop for FileHandleGuard {
 /// Opens a query-only handle (0 access rights, so locked/system files still
 /// open) with reparse semantics, matching `context::file_identity`.
 fn open_query_handle(path: &Path) -> Option<HANDLE> {
+    open_path_handle(
+        path,
+        0,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+}
+
+/// Opens a handle with the given access rights and flags.
+fn open_path_handle(path: &Path, access: u32, flags: FILE_FLAGS_AND_ATTRIBUTES) -> Option<HANDLE> {
     // CreateFileW handles absolute paths fine; only paths beyond MAX_PATH
     // need the \\?\ prefix.
     let needs_long_prefix =
@@ -806,11 +1044,11 @@ fn open_query_handle(path: &Path) -> Option<HANDLE> {
     unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
-            0,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            flags,
             HANDLE(0),
         )
         .ok()
@@ -836,11 +1074,7 @@ type FileMetrics = (u64, Option<u64>, bool, Option<(u64, u64)>, AdsSummary);
 /// file. In Accurate mode this opens **one** handle and reuses it for the
 /// identity read, ADS enumeration and (on `GetCompressedFileSizeW` failure)
 /// the allocation-size fallback — Change 2 + Change 5.
-fn file_metrics(
-    path: &Path,
-    info: &EntryInfo,
-    context: &ScanContext,
-) -> Result<FileMetrics> {
+fn file_metrics(path: &Path, info: &EntryInfo, context: &ScanContext) -> Result<FileMetrics> {
     check_cancelled(context)?;
 
     if context.options().mode == ScanMode::Fast {
@@ -852,9 +1086,39 @@ fn file_metrics(
     let mtime = info.modified;
     let mut logical = info.len;
 
-    // Check cache before opening any handles — a hit skips CreateFileW,
-    // read_identity, and GetCompressedFileSizeW. ADS is always queried fresh
-    // because NTFS does not update LastWriteTime when streams change.
+    // Forced-failure tests exercise the fallback allocation lookup, which
+    // the batched path would bypass entirely.
+    #[cfg(test)]
+    let batched_alloc = if FORCE_ALLOCATED_SIZE_FAILURE.load(std::sync::atomic::Ordering::Relaxed) {
+        None
+    } else {
+        info.allocated
+    };
+    #[cfg(not(test))]
+    let batched_alloc = info.allocated;
+
+    // Handle-enumeration path (Change 8): allocation size and identity came
+    // batched with the directory listing, so the only per-file work left is
+    // ADS enumeration. The attribute cache is skipped — a hit couldn't save
+    // anything (ADS is always queried fresh).
+    if let Some(alloc) = batched_alloc {
+        let handle = open_query_handle(path);
+        let _guard = handle.map(FileHandleGuard);
+        let ids = match info.ids {
+            FileIds::Known(vol, id) => Some((vol, id)),
+            FileIds::NoneOnVolume => None,
+            FileIds::Unknown => handle.and_then(read_identity),
+        };
+        check_cancelled(context)?;
+        let ads = collect_ads_with_fallback(path, handle, context);
+        logical += ads.total_bytes;
+        return Ok((logical, Some(alloc), true, ids, ads));
+    }
+
+    // Find-based fallback path. Check cache before opening any handles — a
+    // hit skips CreateFileW, read_identity, and GetCompressedFileSizeW. ADS
+    // is always queried fresh because NTFS does not update LastWriteTime
+    // when streams change.
     if let Some((cached_alloc, cached_ids)) = context.cache().get_attributes(path, info.len, mtime)
     {
         let ads = collect_ads(path).unwrap_or_default();
@@ -867,30 +1131,8 @@ fn file_metrics(
     let ids = handle.and_then(read_identity);
 
     check_cancelled(context)?;
-    let ads = {
-        let res = match handle {
-            // Prefer the handle-based stream query; fall back to the legacy
-            // path-based FindFirstStreamW if the NT call is unavailable.
-            Some(h) => collect_ads_via_handle(h).or_else(|_| collect_ads(path)),
-            None => collect_ads(path),
-        };
-        match res {
-            Ok(ads) => {
-                logical += ads.total_bytes;
-                ads
-            }
-            Err(err) => {
-                context.record_error(ScanErrorKind::ADSFailed);
-                if context.has_progress() {
-                    context.emit(ProgressEvent::EntryError {
-                        path: path.to_path_buf(),
-                        message: format!("ADS enumeration failed: {}", err),
-                    });
-                }
-                AdsSummary::default()
-            }
-        }
-    };
+    let ads = collect_ads_with_fallback(path, handle, context);
+    logical += ads.total_bytes;
 
     check_cancelled(context)?;
     let mut allocated_complete = true;
@@ -1147,6 +1389,33 @@ fn collect_ads(path: &Path) -> Result<AdsSummary> {
     Ok(summary)
 }
 
+/// Runs ADS enumeration, preferring the handle-based NT query and falling
+/// back to path-based `FindFirstStreamW`. Failures are recorded as
+/// `ADSFailed` and degrade to an empty summary, matching prior behavior.
+fn collect_ads_with_fallback(
+    path: &Path,
+    handle: Option<HANDLE>,
+    context: &ScanContext,
+) -> AdsSummary {
+    let res = match handle {
+        Some(h) => collect_ads_via_handle(h).or_else(|_| collect_ads(path)),
+        None => collect_ads(path),
+    };
+    match res {
+        Ok(ads) => ads,
+        Err(err) => {
+            context.record_error(ScanErrorKind::ADSFailed);
+            if context.has_progress() {
+                context.emit(ProgressEvent::EntryError {
+                    path: path.to_path_buf(),
+                    message: format!("ADS enumeration failed: {}", err),
+                });
+            }
+            AdsSummary::default()
+        }
+    }
+}
+
 fn accumulate_stream(data: &WIN32_FIND_STREAM_DATA, summary: &mut AdsSummary) {
     if let Some(name) = utf16_to_string(&data.cStreamName)
         && name != "::$DATA"
@@ -1254,6 +1523,149 @@ mod tests {
         fn drop(&mut self) {
             FORCE_ALLOCATED_SIZE_FAILURE.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Builds one `FILE_ID_BOTH_DIR_INFO` record with the given name.
+    fn make_id_both_record(
+        name: &str,
+        next_offset: u32,
+        len: u64,
+        alloc: u64,
+        attrs: u32,
+        file_id: u64,
+        mtime_ticks: u64,
+    ) -> Vec<u8> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        let name_bytes: Vec<u8> = wide.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut rec = vec![0u8; IDBOTH_NAME + name_bytes.len()];
+        rec[IDBOTH_NEXT_OFFSET..IDBOTH_NEXT_OFFSET + 4].copy_from_slice(&next_offset.to_le_bytes());
+        rec[IDBOTH_LAST_WRITE..IDBOTH_LAST_WRITE + 8].copy_from_slice(&mtime_ticks.to_le_bytes());
+        rec[IDBOTH_END_OF_FILE..IDBOTH_END_OF_FILE + 8].copy_from_slice(&len.to_le_bytes());
+        rec[IDBOTH_ALLOCATION..IDBOTH_ALLOCATION + 8].copy_from_slice(&alloc.to_le_bytes());
+        rec[IDBOTH_ATTRIBUTES..IDBOTH_ATTRIBUTES + 4].copy_from_slice(&attrs.to_le_bytes());
+        rec[IDBOTH_NAME_LEN..IDBOTH_NAME_LEN + 4]
+            .copy_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        rec[IDBOTH_FILE_ID..IDBOTH_FILE_ID + 8].copy_from_slice(&file_id.to_le_bytes());
+        rec[IDBOTH_NAME..IDBOTH_NAME + name_bytes.len()].copy_from_slice(&name_bytes);
+        rec
+    }
+
+    #[test]
+    fn handle_iter_engages_on_ntfs_and_fills_ids() {
+        let root = tempdir().expect("failed to create temp directory");
+        fs::write(root.path().join("a.bin"), b"data").expect("write failed");
+        fs::create_dir(root.path().join("sub")).expect("mkdir failed");
+
+        let iter = DirIter::new(root.path()).expect("DirIter must open");
+        assert!(
+            matches!(iter, DirIter::Handle(_)),
+            "NTFS temp dir must use the handle-batched iterator, not the find fallback"
+        );
+
+        let entries: Vec<RawEntry> = iter.map(|e| e.expect("entry must parse")).collect();
+        assert_eq!(entries.len(), 2);
+        let file = entries
+            .iter()
+            .find(|e| e.name == "a.bin")
+            .expect("file entry present");
+        assert_eq!(file.len, 4);
+        assert!(file.allocated.is_some(), "batched allocation expected");
+        assert!(
+            matches!(file.ids, FileIds::Known(_, _)),
+            "batched file id expected, got {:?}",
+            file.ids
+        );
+    }
+
+    #[test]
+    fn id_both_offsets_match_win32_struct() {
+        use std::mem::offset_of;
+        use windows::Win32::Storage::FileSystem::FILE_ID_BOTH_DIR_INFO;
+
+        assert_eq!(
+            offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset),
+            IDBOTH_NEXT_OFFSET
+        );
+        assert_eq!(
+            offset_of!(FILE_ID_BOTH_DIR_INFO, LastWriteTime),
+            IDBOTH_LAST_WRITE
+        );
+        assert_eq!(
+            offset_of!(FILE_ID_BOTH_DIR_INFO, EndOfFile),
+            IDBOTH_END_OF_FILE
+        );
+        assert_eq!(
+            offset_of!(FILE_ID_BOTH_DIR_INFO, AllocationSize),
+            IDBOTH_ALLOCATION
+        );
+        assert_eq!(
+            offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes),
+            IDBOTH_ATTRIBUTES
+        );
+        assert_eq!(
+            offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength),
+            IDBOTH_NAME_LEN
+        );
+        assert_eq!(offset_of!(FILE_ID_BOTH_DIR_INFO, FileId), IDBOTH_FILE_ID);
+        assert_eq!(offset_of!(FILE_ID_BOTH_DIR_INFO, FileName), IDBOTH_NAME);
+    }
+
+    #[test]
+    fn parse_id_both_skips_dots_and_reads_fields() {
+        // 2000-01-01 in 100ns ticks since 1601: (11644473600 + 946684800) * 1e7
+        let ticks = 12_591_158_400u64 * 10_000_000;
+        let dot = make_id_both_record(".", 0, 0, 0, 0x10, 5, ticks);
+        let dotdot = make_id_both_record("..", 0, 0, 0, 0x10, 6, ticks);
+        let file = make_id_both_record("file.txt", 0, 1234, 4096, 0x80, 77, ticks);
+
+        let mut buf = Vec::new();
+        let records = [dot, dotdot, file];
+        let last = records.len() - 1;
+        for (i, mut rec) in records.into_iter().enumerate() {
+            // Chain: point each record at the next (8-aligned like the kernel).
+            let padded = rec.len().div_ceil(8) * 8;
+            rec.resize(padded, 0);
+            let next = if i == last { 0u32 } else { padded as u32 };
+            rec[0..4].copy_from_slice(&next.to_le_bytes());
+            buf.extend_from_slice(&rec);
+        }
+
+        let mut out = Vec::new();
+        parse_id_both_dir_buffer(&buf, Some(42), &mut out);
+
+        assert_eq!(out.len(), 1, "dot entries must be skipped");
+        let entry = &out[0];
+        assert_eq!(entry.name, "file.txt");
+        assert_eq!(entry.len, 1234);
+        assert_eq!(entry.allocated, Some(4096));
+        assert_eq!(entry.attributes, 0x80);
+        assert_eq!(entry.ids, FileIds::Known(42, 77));
+        assert!(entry.modified.is_some());
+    }
+
+    #[test]
+    fn parse_id_both_id_zero_and_no_volume() {
+        let rec = make_id_both_record("a.bin", 0, 1, 1, 0x80, 0, 0);
+        let mut out = Vec::new();
+        parse_id_both_dir_buffer(&rec, Some(42), &mut out);
+        assert_eq!(out[0].ids, FileIds::NoneOnVolume);
+        assert_eq!(out[0].modified, None);
+
+        let mut out = Vec::new();
+        parse_id_both_dir_buffer(&rec, None, &mut out);
+        assert_eq!(out[0].ids, FileIds::Unknown);
+    }
+
+    #[test]
+    fn parse_id_both_handles_truncated_and_empty_buffers() {
+        let mut out = Vec::new();
+        parse_id_both_dir_buffer(&[], None, &mut out);
+        assert!(out.is_empty());
+
+        // Header only, no room for the name: skipped without panicking.
+        let rec = make_id_both_record("longname.dat", 0, 1, 1, 0x80, 9, 0);
+        parse_id_both_dir_buffer(&rec[..IDBOTH_NAME + 2], None, &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]
